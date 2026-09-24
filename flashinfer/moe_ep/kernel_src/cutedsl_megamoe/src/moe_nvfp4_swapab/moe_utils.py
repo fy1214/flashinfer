@@ -351,10 +351,12 @@ def compute_expert_token_range(
     :return: (token_offset, tokens_i) where token_offset is the start position
              and tokens_i is the number of tokens for this expert
     """
+    # CuteDSL 4.5.3: `offs[]` loads as Int64; assigning that into an Int32
+    # SSA across a dynamic `if` raises DSLRuntimeError. Cast both sides.
     token_offset = Int32(0)
     if expert_idx > Int32(0):
-        token_offset = offs[expert_idx - 1]  # type: ignore[assignment]
-    tokens_i = offs[expert_idx] - token_offset
+        token_offset = Int32(offs[expert_idx - 1])
+    tokens_i = Int32(offs[expert_idx]) - token_offset
     return token_offset, tokens_i
 
 
