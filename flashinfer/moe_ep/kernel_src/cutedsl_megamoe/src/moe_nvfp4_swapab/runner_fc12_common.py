@@ -1006,6 +1006,14 @@ class Fc12TesterBase:
         # ``gate_up_clamp`` lives on the NVFP4 ProblemDesc only (None elsewhere).
         gate_up_clamp = getattr(problem, "gate_up_clamp", None)
 
+        # Online-amax two-level mode: the per-(token, k1-slice) ``gs``
+        # snapshots are written by the device epilogue, so the reference
+        # quantizer replays the exact scales the kernel used (host-side
+        # replay of the order-free atomicMax chain would be ambiguous).
+        gs_ws_full = getattr(self, "gs_ws", None)
+        online = gs_ws_full is not None and gs_ws_full.numel() > 0
+        k1_width = self.impl.mma_tiler_mnk[2]
+
         # Bit-exact blockscaled GEMM launcher, shared across this expert sweep
         # (compiles per dtype-key on first use, cached internally).
         ref_scaled_mm = _BlockScaledGemmReferenceLauncher(
@@ -1076,6 +1084,10 @@ class Fc12TesterBase:
                 gate_up_clamp=gate_up_clamp,
                 topk_weights=topk_slice,
                 ref_compute_graph=self.misc.ref_compute_graph,
+                online_gs=(
+                    gs_ws_full[d_start : d_start + v_e].clone() if online else None
+                ),
+                k1_width=k1_width,
             )
 
             # ``transformers`` applies the topk weight after fc2 (kind hook;
@@ -1387,6 +1399,7 @@ class Fc12TesterBase:
         self._launch_runtime_kwargs = runtime_kwargs
 
         # -- 6. Launch --
+        self._reset_online_amax_ws()
         if not self.misc.run_target_kernel_only:
             with torch.profiler.profile(
                 activities=[
@@ -1424,6 +1437,7 @@ class Fc12TesterBase:
 
         # Counters require zero-init per launch.
         self.workspace.zero_()
+        self._reset_online_amax_ws()
 
         self._compiled_kernel(**self._launch_runtime_kwargs)
         torch.cuda.synchronize()
@@ -1709,13 +1723,18 @@ class Fc12TesterBase:
         )
 
         if not skip_ref:
-            self.compute_reference()
-            if self.fc2_output_ref is not None:
-                print(
-                    f"fc2_output_ref: shape={tuple(self.fc2_output_ref.shape)}  "
-                    f"stride={self.fc2_output_ref.stride()}  "
-                    f"dtype={self.fc2_output_ref.dtype}"
-                )
+            # Online-amax mode: the reference replays the quantization with
+            # the gs snapshots the *device* wrote, so it must run after the
+            # kernel launch.  All other modes keep the historic ref-first
+            # order.
+            if not self._online_amax_enabled():
+                self.compute_reference()
+                if self.fc2_output_ref is not None:
+                    print(
+                        f"fc2_output_ref: shape={tuple(self.fc2_output_ref.shape)}  "
+                        f"stride={self.fc2_output_ref.stride()}  "
+                        f"dtype={self.fc2_output_ref.dtype}"
+                    )
 
         # Kernel launch.  ``run_kernel`` instantiates the fused kernel,
         # queries / partitions the workspace, transitions torch tensors to
@@ -1723,6 +1742,14 @@ class Fc12TesterBase:
         self.run_kernel()
 
         if not skip_ref:
+            if self._online_amax_enabled():
+                self.compute_reference()
+                if self.fc2_output_ref is not None:
+                    print(
+                        f"fc2_output_ref: shape={tuple(self.fc2_output_ref.shape)}  "
+                        f"stride={self.fc2_output_ref.stride()}  "
+                        f"dtype={self.fc2_output_ref.dtype}"
+                    )
             self.validate()
         print("DONE")
 
@@ -1756,6 +1783,34 @@ class Fc12TesterBase:
         Default: no-op.
         """
         return fc2_fp32
+
+    def _online_amax_enabled(self) -> bool:
+        """True when the online-amax two-level quantization workspaces exist.
+
+        Set up by the NVFP4 tester (``gs_ws`` / ``slice_amax_ws`` /
+        ``arrive_cnt`` device tensors); kinds without them run the historic
+        single-level path unchanged.
+        """
+        gs_ws = getattr(self, "gs_ws", None)
+        return gs_ws is not None and gs_ws.numel() > 0
+
+    def _reset_online_amax_ws(self) -> None:
+        """Zero the slice protocol workspaces before every kernel launch.
+
+        ``slice_amax_ws`` feeds device atomicMax and ``arrive_cnt`` detects
+        the last arriver: stale nonzero values would change every downstream
+        sfc and poison both the reference replay and the determinism check.
+        ``fc1_p_ws`` is additionally zeroed so rows no item wrote (fully
+        empty token blocks) quantize deterministically.
+        """
+        if getattr(self, "gs_ws", None) is not None:
+            self.gs_ws.zero_()
+        if getattr(self, "slice_amax_ws", None) is not None:
+            self.slice_amax_ws.zero_()
+        if getattr(self, "arrive_cnt", None) is not None:
+            self.arrive_cnt.zero_()
+        if getattr(self, "fc1_p_ws", None) is not None:
+            self.fc1_p_ws.zero_()
 
     def _extra_runtime_kwargs(self) -> dict:
         """Return extra kwargs to merge into runtime_kwargs before cute.compile.

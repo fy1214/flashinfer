@@ -52,9 +52,24 @@ from src.ptx_helpers import (
     cp_async_bulk_s2g as _cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_noftz_bf16_s2g as _cp_reduce_async_bulk_add_noftz_bf16_s2g,
     red_add_relaxed_sys_v2_bf16x2 as _red_add_relaxed_sys_v2_bf16x2,
+    red_add_release_gpu_s32 as _red_add_release_gpu_s32,
 )
 from src.flag_batch import GpuReleaseFlagBatchTracker
 from src.sym_buffer import SymBufferDeviceBase
+
+
+@cute.jit
+def _atomic_max_f32_monotonic(ptr, val: cutlass.Float32) -> cutlass.Float32:
+    """Order-free running-max update of a non-negative fp32 gmem slot.
+
+    Thin wrapper over ``cute.arch.atomic_fmax`` (which implements the
+    int-monotonic trick for positive floats).  ``ptr`` is a gmem fp32
+    pointer (e.g. ``tensor.iterator + idx``).  Returns the OLD slot value;
+    the caller computes ``max(old, own)`` locally, which is race-free:
+    atomicMax is commutative, and any interleaved update only makes the
+    true slot larger than what we observe, never smaller than ``own``.
+    """
+    return cute.arch.atomic_fmax(ptr, val)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -963,6 +978,50 @@ class NvFp4OptinalEpiArgs:
     # -----------------------------------
     # MoE domain (token, topk), deepgemm graph only? for transformer graph, we want reduce kernel to perform the score mul.
     topk_scores: Optional[cute.Tensor]
+    # -----------------------------------
+    # Online-amax two-level quant workspace (MoE padded-token domain rows).
+    # All four are None on the historic single-level path.
+    #   gs_ws: (padded_tokens, k1_cnt) fp32 per-(token, k1-slice) snapshot of
+    #     gs = slice_amax/2688 (per-slice, NOT a running prefix max), written
+    #     by the slice's sibling-0 quantizer and consumed by the reference
+    #     replay and the fc2 merge (O += gs * dO).
+    #   slice_amax_ws: (padded_tokens, k1_cnt) fp32 per-slice published amax
+    #     (relaxed atomicMax target of the slice protocol).
+    #   arrive_cnt: (token_block_slots * k1_cnt,) Int32 per-(slot, slice)
+    #     arrival counters (relaxed atomic_add; zero-init per launch).
+    #   fc1_p_ws: (padded_tokens, intermediate_down) fp32 raw post-SwiGLU P
+    #     staging -- ALLOCATED but currently unused on the device: since the
+    #     order-free rewrite the post-SwiGLU fragments stay live in
+    #     registers between Phase A and _quantize_slice (no store/re-read).
+    #     Kept in the workspace contract for tooling/diagnostics.
+    # Protocol (per fc1 work item, slice s = tile_m_idx // group_full) --
+    # order-free form; every item quantizes only its own 64 columns (the
+    # quant work is parallel across the slice's sibling CTAs instead of
+    # serialized on the last arriver).  Deadlock freedom: the arrival is
+    # unconditional and precedes the spin in program order, so a spin only
+    # ever waits on an event that does not depend on any spinner's progress
+    # (the earlier form spun BEFORE arriving / waited for siblings'
+    # completion, which deadlocked under the strided persistent scheduler):
+    #   1. drain acc + SwiGLU; keep P fragments in registers; per-token
+    #      amax over this item's 64 cols (in-thread 16-col max + cross-warp
+    #      smem reduce);
+    #   2. atomicMax(slice_amax_ws[row, s]);
+    #   3. one thread fences GPU-scope, atomic_adds arrive_cnt[slot_base+s],
+    #      then spins (atomic read-back) until the counter reaches
+    #      group_size; an acquire fence makes every sibling's P/amax
+    #      publishes visible, and the named barrier releases the CTA;
+    #   4. EVERY item of the slice (not just the last arriver) quantizes
+    #      its own 64 columns from the register fragments with the now final
+    #      slice-uniform inv_gs = 2688/slice_amax; sibling 0 alone
+    #      publishes gs_ws[row, s] = slice_amax/2688 (both siblings would
+    #      write identical values);
+    #   5. every item returns release_count = 1 and the caller folds it into
+    #      the block's fc1_done release after the TMA drain (the per-slice
+    #      total is still exactly group_size).
+    gs_ws: Optional[cute.Tensor] = None
+    slice_amax_ws: Optional[cute.Tensor] = None
+    arrive_cnt: Optional[cute.Tensor] = None
+    fc1_p_ws: Optional[cute.Tensor] = None
 
 
 # TODO: Need to remove `Swiglu` and `Fp4` out of name, later this should be extended to other activations and dtypes.
@@ -983,6 +1042,7 @@ class SwapABSwigluFp4Epilogue:
 
     _EpilogueSyncWaitBarId = 1  # Arrive and wait only
     _EpilogueAsyncBarIdBase = 4  # Some arrive, the others arrive and wait
+    _OnlineSliceBarId = 15  # Online-amax slice protocol (arrive+wait, 128 epi threads)
     _EpilogueFc1GateUpInterleave = 16
     _EpilogueTokenTileSize = 64  # Fundamentally the epi_tile_n
     _EpilogueFc1IntermediateGateUpTileSize = 128  # Fundamentally epi_tile_m
@@ -1014,7 +1074,23 @@ class SwapABSwigluFp4Epilogue:
             1,
             1,
         ),  # (fc1, fc2) done-counter publish batch
+        online_k1_cnt: int = 0,  # >0: online-amax two-level quant; fc2 needs one
+        # acc TMEM stage per k1 slice plus one spare for fc1/fc2 overlap.
+        token_padding_block: int = 64,  # per-expert data-row padding granularity
+        # (scheduler cumul round-up). 32 is supported ONLY on the online-amax
+        # path: a 64-token subtile may then straddle two experts' segments at
+        # a 32-row boundary, and the fc1 epilogue clips the out-of-segment
+        # right half of the boundary subtile (amax publish / gs publish /
+        # SFC STG / P TMA). 64 keeps every subtile inside one segment.
     ) -> None:
+        if token_padding_block not in (32, 64):
+            raise ValueError(
+                "SwapABSwigluFp4Epilogue supports token_padding_block 32 or 64; "
+                f"got {token_padding_block}. Finer granularities would let a "
+                "subtile half-straddle a segment boundary, which the right-half "
+                "clip does not handle."
+            )
+        self.token_padding_block = token_padding_block
         if fc1_output_dtype is not cutlass.Float4E2M1FN:
             raise NotImplementedError(
                 "SwapABSwigluFp4Epilogue currently assumes fc1 output in "
@@ -1079,7 +1155,41 @@ class SwapABSwigluFp4Epilogue:
         self.overlapping_accum = allow_overlap_acc and (
             self.acc_tmem_cols + self.acc_sf_cols > self._TmemColsTotal // 2
         )
-        self.num_acc_stage = 2
+        # Online-amax two-level quant: each fc2 k1 slice produces its own
+        # gs-weighted partial product, so the fc2 work tile holds one acc
+        # stage per slice; +1 spare stage keeps fc1/fc2 MMA<->epilogue
+        # overlap while an fc2 tile drains all its slices.
+        self.online_k1_cnt = int(online_k1_cnt)
+        if self.online_k1_cnt > 0:
+            if self.overlapping_accum:
+                raise ValueError(
+                    "online-amax two-level quant requires overlapping_accum=False"
+                )
+            if self.fc2_use_bulk or self.reduce_topk_in_kernel:
+                raise NotImplementedError(
+                    "online-amax fc2 slice merge currently implements only the "
+                    "plain STG store path (no UBLK / in-kernel reduce)."
+                )
+            # Prefer a spare stage for cross-tile MMA/epilogue overlap; when
+            # TMEM cannot hold it (e.g. k1_cnt == 3 at 128-col slices), fall
+            # back to exactly k1_cnt stages -- with <=1 tile per CTA (static
+            # decode sched) the spare buys nothing anyway.
+            self.num_acc_stage = self.online_k1_cnt + 1
+            if (
+                self.num_acc_stage * self.acc_tmem_cols + self.acc_sf_cols
+                > self._TmemColsTotal
+            ):
+                self.num_acc_stage = self.online_k1_cnt
+            acc_tmem_demand = (
+                self.num_acc_stage * self.acc_tmem_cols + self.acc_sf_cols
+            )
+            if acc_tmem_demand > self._TmemColsTotal:
+                raise ValueError(
+                    f"online-amax two-level quant needs {self.num_acc_stage} acc "
+                    f"stages ({acc_tmem_demand} TMEM cols) > {self._TmemColsTotal}"
+                )
+        else:
+            self.num_acc_stage = 2
         self.num_acc_pipeline_stages = (
             1 if self.overlapping_accum else self.num_acc_stage
         )
@@ -1111,16 +1221,30 @@ class SwapABSwigluFp4Epilogue:
             epi_smem: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int8, self.epi_smem_bytes], 256
             ]
+            # Online-amax slice protocol scratch: per-warp per-token block
+            # amaxes staged for the cross-warp reduce (4 warps x subtile_cnt
+            # x 64 tokens fp32), plus the CTA-uniform slice-full flag.
+            # Only touched on the two-level path.
+            online_scratch: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int8, 4 * 64 * self.subtile_cnt * 4
+                ],
+                128,
+            ]
+            online_flag: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 16]
 
         return EpilogueSharedStorage
 
     def fc1_staged_smem_layout(
-        self, n_stages: int, without_stage_mode: bool = False
+        self, n_stages: int, without_stage_mode: bool = False, token_rows: int = 0
     ) -> Union[cute.Layout, cute.ComposedLayout]:
+        # token_rows: override the token extent (e.g. 32 for the pad-32
+        # boundary half-box atom).  0 = the full _EpilogueTokenTileSize.
+        rows = token_rows if token_rows else self._EpilogueTokenTileSize
         layout = sm100_utils.make_smem_layout_epi(
             self.fc1_output_dtype,
             utils.LayoutEnum.ROW_MAJOR,
-            (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize),
+            (rows, self._EpilogueFc1IntermediateDownTileSize),
             n_stages,
         )
         if without_stage_mode:
@@ -1145,6 +1269,11 @@ class SwapABSwigluFp4Epilogue:
         tidx: cutlass.Int32,
         optional_epi_args: NvFp4OptinalEpiArgs = None,  # Epilogue optinal runtime arguments.
         token_comm_args=None,  # Only valid when enable token communication
+        tma_atom_fc1_output_half32: Optional[cute.CopyAtom] = None,
+        # 32-row-box bulk-store atom for the token_padding_block=32 boundary
+        # subtile whose right 32 rows fall into the NEXT expert's segment.
+        # Required iff token_padding_block == 32; unused (const-elided)
+        # otherwise.
     ):
         if cutlass.const_expr(optional_epi_args is None):
             optional_epi_args = NvFp4OptinalEpiArgs(
@@ -1152,6 +1281,10 @@ class SwapABSwigluFp4Epilogue:
                 fc2_alpha=None,
                 fc1_norm_const=None,
                 topk_scores=None,
+                gs_ws=None,
+                slice_amax_ws=None,
+                arrive_cnt=None,
+                fc1_p_ws=None,
             )
         tmem_acc = cute.make_tensor(
             cute.recast_ptr(tmem_ptr, dtype=cutlass.Float32),
@@ -1171,6 +1304,7 @@ class SwapABSwigluFp4Epilogue:
             fc1_output_sf,
             fc1_done_counter,
             optional_epi_args,
+            tma_atom_fc1_output_half32,
         )
         fc2_epi = SwapABFc2Epilogue(
             self, tidx, epi_smem_storage, fc2_output, token_comm_args, optional_epi_args
@@ -1193,55 +1327,87 @@ class SwapABSwigluFp4Epilogue:
             tid=tidx % (self._EpilogueWarpCnt * 32),
         )
 
+        online_fc2 = (
+            self.online_k1_cnt > 0 and optional_epi_args.gs_ws is not None
+        )
+
         while work_tile_info.is_valid_tile:
             if cutlass.const_expr(self.overlapping_accum):
                 tmem_stage_idx = acc_consumer_state.phase
             else:
                 tmem_stage_idx = acc_consumer_state.index
             tmem_acc_current = tmem_acc[None, None, tmem_stage_idx]
+            fc1_done_release_count = cutlass.Int32(0)
             if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
                 # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
-                fc1_epi(
+                fc1_done_release_count = fc1_epi(
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_current,
                     acc_pipeline=acc_pipeline,
                     acc_consumer_state=acc_consumer_state,
                     is_odd_turn=is_odd_turn,
                 )
+                acc_consumer_state.advance()
             else:
-                # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
-                fc2_epi(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                    is_odd_turn=is_odd_turn,
-                )
+                if cutlass.const_expr(online_fc2):
+                    # Online two-level fc2: the MMA warp committed one acc
+                    # stage per k1 slice; merge them gs-weighted here.  This
+                    # call consumes and advances acc_consumer_state
+                    # self.online_k1_cnt times (no advance below).
+                    fc2_epi.run_online(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                    )
+                else:
+                    # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
+                    fc2_epi(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc_current,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                        is_odd_turn=is_odd_turn,
+                    )
+                    acc_consumer_state.advance()
             iket.range_pop()
 
             prev_work_tile_info = work_tile_info
             cur_was_linear1 = prev_work_tile_info.phase == cutlass.Int32(
                 BlockPhase.Linear1
             )
-
-            acc_consumer_state.advance()
             if cutlass.const_expr(self.overlapping_accum):
                 is_odd_turn = cutlass.Int32(1) - is_odd_turn
 
             work_tile_info = sched_consumer.consume_work()
 
             # Drain fc1 TMA stores and sf stores before publishing the fc1-done counter.
+            # NB: full completion (read=False), NOT just smem-read completion:
+            # the fc2 task's TMA loads read this data from GMEM in another CTA,
+            # so the bulk S2G writes must be complete (and thus device-visible)
+            # before the release; wait_group.read would only protect smem reuse.
             if cur_was_linear1:
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.cp_async_bulk_wait_group(0, read=False)
             # _fence_rel_gpu()
             wait_only_named_barrier.arrive_and_wait()
 
             # Publish completion for the work tile snapshotted above.
             if cur_was_linear1:
-                flag_tracker = fc1_epi.signal_fc1_done(
-                    prev_work_tile_info, work_tile_info, flag_tracker
-                )
+                if cutlass.const_expr(optional_epi_args.gs_ws is not None):
+                    # Online path: every in-bound item releases its own +1
+                    # after quantizing its slice fragment (the per-slice
+                    # total is still exactly group_size).
+                    flag_tracker = fc1_epi.signal_fc1_done(
+                        prev_work_tile_info,
+                        work_tile_info,
+                        flag_tracker,
+                        release_count=fc1_done_release_count,
+                    )
+                else:
+                    flag_tracker = fc1_epi.signal_fc1_done(
+                        prev_work_tile_info, work_tile_info, flag_tracker
+                    )
             else:
                 flag_tracker = fc2_epi.signal_fc2_done(
                     prev_work_tile_info, work_tile_info, flag_tracker
@@ -1278,6 +1444,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_output_sf: cute.Tensor,  # fake (m,n,l) domain
         fc1_done_counter: cute.Tensor,  # 1D tensor
         optional_epi_args: NvFp4OptinalEpiArgs,
+        tma_atom_fc1_output_half32: Optional[cute.CopyAtom] = None,
     ):
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
@@ -1285,6 +1452,19 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         self.lane_idx = self.tidx % 32
         if cutlass.const_expr(base.fc1_output_dtype.width != 4):
             raise NotImplementedError("Remember to adjust the swizzle and smem size.")
+        if cutlass.const_expr(base.token_padding_block == 32):
+            if cutlass.const_expr(tma_atom_fc1_output_half32 is None):
+                raise ValueError(
+                    "token_padding_block=32 needs tma_atom_fc1_output_half32 "
+                    "(32-row-box fc1 output store atom for boundary subtiles)."
+                )
+            if cutlass.const_expr(optional_epi_args.gs_ws is None):
+                # Single-level path does not implement the boundary clip; the
+                # online-amax path is the only supported pad-32 configuration.
+                raise ValueError(
+                    "token_padding_block=32 requires the online-amax two-level "
+                    "path (gs_ws); the single-level path lacks the boundary clip."
+                )
         # (token64, intermediate, stage)
         self.smem_tensor = cute.make_tensor(
             cute.recast_ptr(
@@ -1296,10 +1476,44 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         )
         self.sched_ext = sched_ext
         self.fc1_tma_atom = tma_atom_fc1_output
+        self.fc1_tma_atom_half32 = tma_atom_fc1_output_half32
         self.fc1_output = fc1_output
         self.fc1_output_sf = fc1_output_sf
         self.fc1_done_counter = fc1_done_counter
         self.optional_epi_args = optional_epi_args
+        # Online-amax slice-protocol state (None on the single-level path).
+        self.gs_ws = optional_epi_args.gs_ws
+        self.slice_amax_ws = optional_epi_args.slice_amax_ws
+        self.arrive_cnt = optional_epi_args.arrive_cnt
+        self.fc1_p_ws = optional_epi_args.fc1_p_ws
+        if cutlass.const_expr(self.gs_ws is not None):
+            # (warp, token) fp32 scratch for the cross-warp amax reduce;
+            # token axis covers subtile_cnt x 64 token slots.
+            self.amax_scratch = cute.make_tensor(
+                cute.recast_ptr(
+                    epi_smem_storage.online_scratch.data_ptr(),
+                    dtype=cutlass.Float32,
+                ),
+                cute.make_layout(
+                    (
+                        self._EpilogueWarpCnt,
+                        self.subtile_cnt * self._EpilogueTokenTileSize,
+                    )
+                ),
+            )
+            # CTA-uniform slice-full flag (written by tidx0 once the slice's
+            # arrive_cnt reached group_size, read after the named barrier).
+            self.online_flag = cute.make_tensor(
+                cute.recast_ptr(
+                    epi_smem_storage.online_flag.data_ptr(),
+                    dtype=cutlass.Int32,
+                ),
+                cute.make_layout((1,)),
+            )
+            self.online_slice_barrier = pipeline.NamedBarrier(
+                barrier_id=self._OnlineSliceBarId,
+                num_threads=self._EpilogueWarpCnt * 32,
+            )
         self._freeze()
 
     def __getattr__(self, name):
@@ -1318,7 +1532,31 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         return self
 
     @cute.jit
-    def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):
+    def signal_fc1_done(
+        self, work_tile_info, next_work_tile_info, flag_tracker, release_count=None
+    ):
+        if cutlass.const_expr(release_count is not None):
+            # Online-amax two-level path (order-free): every in-bound item
+            # releases its own +1 after quantizing its slice fragment, so
+            # the per-slice total is exactly group_size (out-of-bound items
+            # release nothing and were never counted).  The direct
+            # red.release happens after the loop-level TMA drain, matching
+            # the historic flag-batch point.
+            # NB: single-thread release (tidx 0) -- the historic accumulate
+            # path elects internally, the direct red must be guarded here or
+            # every epilogue thread would each release +1, blowing past the
+            # fc2 threshold and letting fc2 read incomplete qP.
+            slot = (
+                work_tile_info.cumulative_token_block_count
+                + work_tile_info.tile_n_idx
+            )
+            if release_count > 0 and self.tidx == 0:
+                _red_add_release_gpu_s32(
+                    self.fc1_done_counter.iterator + slot,
+                    release_count,
+                )
+            return flag_tracker
+        # Single-level path (historic): every in-bound item releases +1.
         # Only in-bound intermediate_downproj tiles signal; OOB -> null slot.
         if cutlass.const_expr(
             self.static_expert_shape is None
@@ -1348,7 +1586,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         acc_pipeline,
         acc_consumer_state,
         is_odd_turn: cutlass.Int32,
-    ):
+    ) -> cutlass.Int32:
         # (tokens_this_expert, intermediate_down, 1)
         real_fc1_output, _ = self.sched_ext.get_gmem_tensor(
             "c",
@@ -1382,6 +1620,55 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         iket.range_push("fc1_epi")
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
 
+        release_count = cutlass.Int32(0)
+        if cutlass.const_expr(self.gs_ws is not None):
+            # Online-amax two-level path: order-free slice quant (see
+            # run_item_online).  Processes every subtile unconditionally
+            # (per-row scales keep padding-row garbage out of valid rows)
+            # and takes the non-overlap drain order (subtile_idx == real_i).
+            if cutlass.const_expr(self.overlapping_accum):
+                raise NotImplementedError(
+                    "online-amax two-level quant requires overlapping_accum=False"
+                )
+            release_count = self.run_item_online(
+                work_tile_info=work_tile_info,
+                tmem_acc_tensor_tiled_by_epi_tile=tmem_acc_tensor_tiled_by_epi_tile,
+                fc1_output=real_fc1_output,
+                fc1_output_sf=real_fc1_output_sf,
+                alpha_val=alpha_val,
+                valid_tokens=valid_tokens,
+                acc_pipeline=acc_pipeline,
+                acc_consumer_state=acc_consumer_state,
+            )
+        else:
+            self._run_item_single_level(
+                work_tile_info=work_tile_info,
+                tmem_acc_tensor_tiled_by_epi_tile=tmem_acc_tensor_tiled_by_epi_tile,
+                fc1_output=real_fc1_output,
+                fc1_output_sf=real_fc1_output_sf,
+                alpha_val=alpha_val,
+                norm_const=norm_const,
+                valid_tokens=valid_tokens,
+                acc_pipeline=acc_pipeline,
+                acc_consumer_state=acc_consumer_state,
+                is_odd_turn=is_odd_turn,
+            )
+        return release_count
+
+    @cute.jit
+    def _run_item_single_level(
+        self,
+        work_tile_info: MoEWorkTileInfo,
+        tmem_acc_tensor_tiled_by_epi_tile: cute.Tensor,
+        fc1_output: cute.Tensor,
+        fc1_output_sf: cute.Tensor,
+        alpha_val: Optional[cutlass.Float32],
+        norm_const: Optional[cutlass.Float32],
+        valid_tokens: cutlass.Int32,
+        acc_pipeline,
+        acc_consumer_state,
+        is_odd_turn: cutlass.Int32,
+    ):
         # Overlap path preloads two subtiles before releasing acc TMEM.
         unroll_tile_cnt = 2 if cutlass.const_expr(self.overlapping_accum) else 0
         remain_subtile_cnt = self.subtile_cnt - unroll_tile_cnt
@@ -1438,8 +1725,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                             None, None, subtile_idx_second
                         ],
                         preload_acc=preload_pair[i],
-                        fc1_output=real_fc1_output,
-                        fc1_output_sf=real_fc1_output_sf,
+                        fc1_output=fc1_output,
+                        fc1_output_sf=fc1_output_sf,
                         alpha_val=alpha_val,
                         norm_const=norm_const,
                     )
@@ -1461,8 +1748,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                         None, None, subtile_idx
                     ],
                     preload_acc=None,
-                    fc1_output=real_fc1_output,
-                    fc1_output_sf=real_fc1_output_sf,
+                    fc1_output=fc1_output,
+                    fc1_output_sf=fc1_output_sf,
                     alpha_val=alpha_val,
                     norm_const=norm_const,
                 )
@@ -1471,6 +1758,366 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         if cutlass.const_expr(not self.overlapping_accum):
             cute.arch.fence_view_async_tmem_load()
             acc_pipeline.consumer_release(acc_consumer_state)
+
+    def _right_half_in_seg(self, valid_tokens, subtile_idx):
+        """Boundary-clip predicate for token_padding_block < 64.
+
+        A run subtile (64k < valid_tokens) straddles the expert's segment end
+        iff round_up(valid, pad) < 64k+64.  The left 32 rows always stay
+        in-segment (run guard implies seg >= 64k+pad >= 64k+32); the right 32
+        rows belong to the NEXT expert's segment when the predicate is False
+        and every right-half store / amax publish must be skipped.  With
+        pad=64 the predicate is trace-time True (historic invariant), so all
+        clip sites const-elide.
+        """
+        p = self.base.token_padding_block
+        if p == 64:
+            return True
+        seg = ((valid_tokens + (p - 1)) // p) * p
+        return subtile_idx * self._EpilogueTokenTileSize + self._EpilogueTokenTileSize <= seg
+
+    @cute.jit
+    def run_item_online(
+        self,
+        work_tile_info: MoEWorkTileInfo,
+        tmem_acc_tensor_tiled_by_epi_tile: cute.Tensor,
+        fc1_output: cute.Tensor,
+        fc1_output_sf: cute.Tensor,
+        alpha_val: Optional[cutlass.Float32],
+        valid_tokens: cutlass.Int32,
+        acc_pipeline,
+        acc_consumer_state,
+    ) -> cutlass.Int32:
+        """Online-amax two-level path for one fc1 work item (order-free form).
+
+        Cross-CTA slice protocol -- every item quantizes only its own
+        64 columns once the slice's gs has resolved, so the quant work is
+        parallel across sibling CTAs (the historic last-arriver form
+        serialized the whole slice's quant on one CTA).  Deadlock freedom:
+        the arrival is unconditional and precedes the spin in program
+        order, so a spin only waits on events that never depend on any
+        spinner's progress -- safe under any item-pop order, including the
+        strided persistent scheduler that deadlocked the earlier
+        spin-before-arriving form:
+
+          Phase A: every item drains its subtiles, SwiGLUs (keeping the
+                   post-SwiGLU fragments live in registers for step 4), and
+                   stages per-token amaxes in smem.
+          Phase B: cross-warp amax reduce, then ``atomicMax`` publish into
+                   ``slice_amax_ws[row, slice_idx]``.
+          Arrive:  tidx0 fences GPU-scope, ``atomic_add``s
+                   ``arrive_cnt[slot_base + slice_idx]``, then spins
+                   (atomic read-back) until the counter reaches
+                   ``group_size``; an acquire fence + named barrier release
+                   the CTA once every sibling has arrived.
+          Quantize: EVERY item re-reads its own 64 columns from the
+                   workspace and quantizes them with one slice-uniform
+                   per-token ``gs = slice_amax/2688`` (sibling 0 alone
+                   publishes ``gs_ws``), storing qP/sfc through the usual
+                   smem+TMA path.
+
+        Returns this item's fc1_done arrival count (1 for every in-bound
+        item; the slice total is still exactly group_size); the caller
+        folds it into the fc1_done release exactly once, after the TMA
+        drain.
+        """
+        quant = QuantImpl("nvfp4", "regs_in_thread")
+
+        # -- slice geometry (uniform across the CTA) --
+        if cutlass.const_expr(
+            self.static_expert_shape is None
+            or self.intermediate_downproj % self.cluster_tile_intermediate_downproj != 0
+        ):
+            in_bound = (
+                work_tile_info.tile_m_idx * self._EpilogueFc1IntermediateDownTileSize
+                < fc1_output.shape[1]
+            )
+        else:
+            in_bound = True
+        group_full = self.cta_tile_k // self._EpilogueFc1IntermediateDownTileSize
+        m_inbound = (
+            cute.size(fc1_output, mode=[1])
+            + self._EpilogueFc1IntermediateDownTileSize
+            - 1
+        ) // self._EpilogueFc1IntermediateDownTileSize
+        slice_idx = work_tile_info.tile_m_idx // group_full
+        k1_cnt = cute.size(self.gs_ws, mode=[1])
+        slot_base = (
+            work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+        ) * k1_cnt
+        group_size = cutlass.Int32(group_full)
+        if m_inbound - slice_idx * group_full < group_size:
+            group_size = m_inbound - slice_idx * group_full
+
+        release_count = cutlass.Int32(0)
+        if in_bound:
+            # gs_ws / slice_amax_ws / fc1_p_ws are laid out by DENSE global
+            # token row -- the same convention as the fc1_output / reference
+            # rows: expert base = cumulative_data_physical_row (sum of VALID
+            # tokens of previous experts) + tile_n_idx * cta_tile_n.  Do NOT
+            # use the cumulative block-slot convention here: with partial
+            # tail blocks (valid_tokens < cta_tile_n) slot-based rows would
+            # land on other experts' dense rows (and past the tensor end).
+            token_block_base = (
+                work_tile_info.cumulative_data_physical_row
+                + work_tile_info.tile_n_idx * self.cta_tile_n
+            )
+            if valid_tokens > 0:
+                # ---- Phase A: drain + SwiGLU; P fragments stay in registers ----
+                # No gmem round-trip: the post-SwiGLU fragments are consumed
+                # by _quantize_slice AFTER the arrive-then-spin barrier, and
+                # a Python list cannot cross a dynamic-if region boundary,
+                # so they are collected in straight-line code here.  Padding
+                # subtiles are processed too (TMEM of zero-padded rows reads
+                # zeros; their fragments are never consumed -- every use
+                # below keeps the historic subtile guard).
+                frags = []
+                for subtile_idx in cutlass.range_constexpr(self.subtile_cnt):
+                    two_token, _topk = self.subtile_pre_quant(
+                        work_tile_info=work_tile_info,
+                        subtile_idx=cutlass.Int32(subtile_idx),
+                        tmem_subtile_tensor=tmem_acc_tensor_tiled_by_epi_tile[
+                            None, None, subtile_idx
+                        ],
+                        preload_acc=None,
+                        alpha_val=alpha_val,
+                    )
+                    frags.append(two_token)
+                # Early acc release: every TMEM read of this item happens in
+                # the frag loop above (the quant below consumes the register
+                # fragments, not TMEM), so the acc stage is handed back to
+                # the producer BEFORE the amax publish / arrive-then-spin /
+                # quant -- the next fc1 tile's MMA fills it while this item
+                # waits on its slice siblings.  This recovers the
+                # MMA<->epilogue overlap that overlapping_accum would give,
+                # without the stage-cycling machinery (which is incompatible
+                # with the fc2 per-slice multi-stage consumption of the same
+                # acc pipeline).
+                cute.arch.fence_view_async_tmem_load()
+                acc_pipeline.consumer_release(acc_consumer_state)
+                # Per-warp per-token amax staging (guarded: padding rows
+                # are not published; right half clipped when the subtile
+                # straddles the segment end at token_padding_block=32).
+                for subtile_idx in cutlass.range_constexpr(self.subtile_cnt):
+                    if subtile_idx * self._EpilogueTokenTileSize < valid_tokens:
+                        amax_t0 = quant._amax_thread_fp32(frags[subtile_idx][0])
+                        amax_t1 = quant._amax_thread_fp32(frags[subtile_idx][1])
+                        tok_base = subtile_idx * self._EpilogueTokenTileSize
+                        self.amax_scratch[
+                            self.warp_idx, tok_base + self.lane_idx
+                        ] = amax_t0
+                        if self._right_half_in_seg(valid_tokens, subtile_idx):
+                            self.amax_scratch[
+                                self.warp_idx, tok_base + self.lane_idx + 32
+                            ] = amax_t1
+                self.online_slice_barrier.arrive_and_wait()
+
+                # ---- Phase B: cross-warp reduce + publish ----
+                for subtile_idx in cutlass.range_constexpr(self.subtile_cnt):
+                    if subtile_idx * self._EpilogueTokenTileSize < valid_tokens:
+                        tok_base = subtile_idx * self._EpilogueTokenTileSize
+                        tok_l = tok_base + self.lane_idx
+                        tile_amax_t0 = self.amax_scratch[0, tok_l]
+                        for w in cutlass.range_constexpr(
+                            1, self._EpilogueWarpCnt
+                        ):
+                            tile_amax_t0 = cute.arch.fmax(
+                                tile_amax_t0, self.amax_scratch[w, tok_l]
+                            )
+                        row0 = token_block_base + tok_l
+                        _atomic_max_f32_monotonic(
+                            self.slice_amax_ws.iterator
+                            + (row0 * k1_cnt + slice_idx),
+                            tile_amax_t0,
+                        )
+                        if self._right_half_in_seg(valid_tokens, subtile_idx):
+                            tile_amax_t1 = self.amax_scratch[0, tok_l + 32]
+                            for w in cutlass.range_constexpr(
+                                1, self._EpilogueWarpCnt
+                            ):
+                                tile_amax_t1 = cute.arch.fmax(
+                                    tile_amax_t1, self.amax_scratch[w, tok_l + 32]
+                                )
+                            row1 = row0 + 32
+                            _atomic_max_f32_monotonic(
+                                self.slice_amax_ws.iterator
+                                + (row1 * k1_cnt + slice_idx),
+                                tile_amax_t1,
+                            )
+                self.online_slice_barrier.arrive_and_wait()
+
+                # ---- Arrive, then spin until the whole slice arrived ----
+                # Arrive-then-spin: the arrival is unconditional and precedes
+                # the spin in program order, so a spin only waits on events
+                # that never depend on any spinner's progress -- deadlock-free
+                # under any item-pop order (the historic form spun before
+                # arriving / waited for siblings' completion and deadlocked
+                # under the strided persistent scheduler).
+                if self.tidx == 0:
+                    # Release: amax publishes must be visible before the
+                    # arrival.
+                    cute.arch.fence_acq_rel_gpu()
+                    cute.arch.atomic_add(
+                        self.arrive_cnt.iterator + slot_base + slice_idx,
+                        cutlass.Int32(1),
+                    )
+                    full = cutlass.Int32(0)
+                    while full == 0:
+                        cur = cute.arch.atomic_add(
+                            self.arrive_cnt.iterator + slot_base + slice_idx,
+                            cutlass.Int32(0),
+                        )
+                        if cur >= group_size:
+                            full = cutlass.Int32(1)
+                    # Acquire: every sibling's amax publishes (fenced before
+                    # their arrivals) must be visible to the ws reads below.
+                    cute.arch.fence_acq_rel_gpu()
+                    self.online_flag[0] = cutlass.Int32(1)
+                self.online_slice_barrier.arrive_and_wait()
+                if self.online_flag[0] != 0:
+                    # Quantize this item's own 64 columns straight from the
+                    # register fragments (no gmem round-trip); the per-item
+                    # release keeps the slice total at exactly group_size.
+                    release_count = cutlass.Int32(1)
+                    self._quantize_slice(
+                        work_tile_info=work_tile_info,
+                        fc1_output=fc1_output,
+                        fc1_output_sf=fc1_output_sf,
+                        token_block_base=token_block_base,
+                        slice_idx=slice_idx,
+                        group_full=group_full,
+                        k1_cnt=k1_cnt,
+                        valid_tokens=valid_tokens,
+                        frags=tuple(frags),
+                    )
+            else:
+                # Padding-only item (its whole token block is padding): no
+                # TMEM reads, but the acc stage must still be returned.
+                cute.arch.fence_view_async_tmem_load()
+                acc_pipeline.consumer_release(acc_consumer_state)
+                if self.tidx == 0:
+                    # It is still counted in group_size, so it must arrive;
+                    # nothing to publish, spin for, or quantize.  The caller
+                    # releases its single fc1_done arrival.
+                    cute.arch.fence_acq_rel_gpu()
+                    cute.arch.atomic_add(
+                        self.arrive_cnt.iterator + slot_base + slice_idx,
+                        cutlass.Int32(1),
+                    )
+                release_count = cutlass.Int32(1)
+        return release_count
+
+    @cute.jit
+    def _quantize_slice(
+        self,
+        work_tile_info: MoEWorkTileInfo,
+        fc1_output: cute.Tensor,
+        fc1_output_sf: cute.Tensor,
+        token_block_base: cutlass.Int32,
+        slice_idx: cutlass.Int32,
+        group_full: cutlass.Int32,
+        k1_cnt: cutlass.Int32,
+        valid_tokens: cutlass.Int32,
+        frags: Tuple[cute.Tensor, ...],
+    ):
+        """Order-free slice quant: quantize THIS item's own 64 columns.
+
+        Runs on every item of the slice after the arrive-then-spin barrier
+        resolved the slice-uniform gs, so the sibling CTAs quantize in
+        parallel instead of serializing on a unique last arriver.  Consumes
+        the post-SwiGLU fragments kept live in registers since Phase A (no
+        gmem round-trip); the acquire fence at the spin guarantees sibling
+        amax publishes are visible.  Sibling 0 alone publishes ``gs_ws``
+        for the reference replay.  The caller
+        signals this item's fc1_done arrival after the TMA drain; the
+        slice's total remains exactly group_size.  Entirely-padding subtiles
+        are skipped (same guard as the single-level path): their dense ws
+        rows alias the NEXT expert.
+        """
+        # Publish gs snapshots for every valid token row of this block.
+        # Single writer (sibling 0): all siblings would write identical
+        # values from the same final slice_amax_ws.
+        if work_tile_info.tile_m_idx == slice_idx * group_full:
+            for subtile_idx in cutlass.range_constexpr(self.subtile_cnt):
+                if subtile_idx * self._EpilogueTokenTileSize < valid_tokens:
+                    for half in cutlass.range_constexpr(2):
+                        if half == 0 or self._right_half_in_seg(
+                            valid_tokens, subtile_idx
+                        ):
+                            row_g = (
+                                token_block_base
+                                + subtile_idx * self._EpilogueTokenTileSize
+                                + self.lane_idx
+                                + 32 * half
+                            )
+                            amax = self.slice_amax_ws[row_g, slice_idx]
+                            self.gs_ws[row_g, slice_idx] = amax / cutlass.Float32(
+                                2688.0
+                            )
+
+        if cutlass.const_expr(self.optional_epi_args.topk_scores is not None):
+            topk_tensor, _ = self.sched_ext.get_gmem_tensor(
+                "topk",
+                self.optional_epi_args.topk_scores,
+                work_tile_info,
+            )
+        else:
+            topk_tensor = None
+
+        tile_n_idx = work_tile_info.tile_n_idx
+        intermediate_output_size = cute.size(fc1_output, mode=[1])
+        sib_tile_m = work_tile_info.tile_m_idx
+        for subtile_idx in cutlass.range_constexpr(self.subtile_cnt):
+            if subtile_idx * self._EpilogueTokenTileSize < valid_tokens:
+                row0 = (
+                    token_block_base
+                    + subtile_idx * self._EpilogueTokenTileSize
+                    + self.lane_idx
+                )
+                row1 = row0 + 32
+                # Post-SwiGLU fragments are still live in registers from
+                # Phase A (no gmem round-trip).
+                tok0, tok1 = frags[subtile_idx]
+                amax0 = self.slice_amax_ws[row0, slice_idx]
+                amax1 = self.slice_amax_ws[row1, slice_idx]
+                inv0 = cute.arch.fmin(
+                    cutlass.Float32(2688.0) / amax0, Fp32Max
+                )
+                inv1 = cute.arch.fmin(
+                    cutlass.Float32(2688.0) / amax1, Fp32Max
+                )
+                if cutlass.const_expr(topk_tensor is not None):
+                    local_row0 = (
+                        tile_n_idx * self.cta_tile_n
+                        + subtile_idx * self._EpilogueTokenTileSize
+                        + self.lane_idx
+                    )
+                    topk_pair = (
+                        topk_tensor[local_row0],
+                        topk_tensor[local_row0 + 32],
+                    )
+                else:
+                    topk_pair = None
+                self.subtile_quant_store(
+                    tile_m_idx=sib_tile_m,
+                    tile_n_idx=tile_n_idx,
+                    subtile_idx=cutlass.Int32(subtile_idx),
+                    fc1_output=fc1_output,
+                    fc1_output_sf=fc1_output_sf,
+                    two_token=(tok0, tok1),
+                    topk_scores=topk_pair,
+                    norm_const=None,
+                    inv_gs_pair=(inv0, inv1),
+                    intermediate_output_size=intermediate_output_size,
+                    right_half=self._right_half_in_seg(valid_tokens, subtile_idx),
+                )
+        # Commit this item's TMA stores and wait their smem reads before
+        # the caller's release: the smem output stages are reused by the
+        # next work tile's quant.
+        cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_wait_group(0, read=True)
+        self.online_slice_barrier.arrive_and_wait()
+
 
     @cute.jit
     def run_subtile(
@@ -1487,6 +2134,47 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         alpha_val: Optional[cutlass.Float32],
         norm_const: Optional[cutlass.Float32],
     ):
+        """Single-level fused path: pre-quant immediately followed by
+        quant+store (the historic behavior)."""
+        two_token, topk_scores = self.subtile_pre_quant(
+            work_tile_info=work_tile_info,
+            subtile_idx=subtile_idx,
+            tmem_subtile_tensor=tmem_subtile_tensor,
+            preload_acc=preload_acc,
+            alpha_val=alpha_val,
+        )
+        self.subtile_quant_store(
+            tile_m_idx=work_tile_info.tile_m_idx,
+            tile_n_idx=work_tile_info.tile_n_idx,
+            subtile_idx=subtile_idx,
+            fc1_output=fc1_output,
+            fc1_output_sf=fc1_output_sf,
+            two_token=two_token,
+            topk_scores=topk_scores,
+            norm_const=norm_const,
+            inv_gs_pair=None,
+            intermediate_output_size=cute.size(fc1_output, mode=[1]),
+        )
+
+    @cute.jit
+    def subtile_pre_quant(
+        self,
+        work_tile_info: MoEWorkTileInfo,
+        subtile_idx: cutlass.Int32,
+        # (intermedaite_gateup_tile, token_subtile), fundamentally (epi_tile_m, epi_tile_n)
+        tmem_subtile_tensor: cute.Tensor,
+        # Rmems preloaded from tmem, contract with downstream tmem trans. Do not assume mapping here.
+        preload_acc: Tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+        alpha_val: Optional[cutlass.Float32],
+    ):
+        """Steps -1..1: topk preload, raw-acc tmem load, SwiGLU (+alpha/clamp).
+
+        Returns ``(two_token, topk_scores)`` where ``two_token`` is this
+        thread's post-SwiGLU 16-wide blocks for its two tokens (see the
+        transpose contract below).  The caller decides when to quantize,
+        which lets the online-amax path defer quantization until the slice
+        protocol has resolved a slice-uniform gs.
+        """
         if cutlass.const_expr(self.optional_epi_args.topk_scores is not None):
             # This means we need to perform DeepGEMM computation graph, topk_score at fc1 pre-quant
             topk_score_tensor, _ = self.sched_ext.get_gmem_tensor(
@@ -1607,15 +2295,47 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         )
         token_0_32_pre_quant = token_0_32_tmem_trans.from_r1_perm_until_last_store()
 
+        return (token_0_32_pre_quant, token_32_64_pre_quant), topk_scores
+
+    @cute.jit
+    def subtile_quant_store(
+        self,
+        tile_m_idx: cutlass.Int32,
+        tile_n_idx: cutlass.Int32,
+        subtile_idx: cutlass.Int32,
+        # (tokens_this_expert, intermediate_down, 1)
+        fc1_output: cute.Tensor,
+        fc1_output_sf: cute.Tensor,
+        # Post-SwiGLU per-thread blocks (subtile_pre_quant contract).
+        two_token: Tuple[cute.Tensor, cute.Tensor],
+        topk_scores: Optional[Tuple[cutlass.Float32, cutlass.Float32]],
+        norm_const: Optional[cutlass.Float32],
+        inv_gs_pair: Optional[Tuple[cutlass.Float32, cutlass.Float32]],
+        intermediate_output_size: cutlass.Int32,
+        right_half=True,
+        # Boundary clip (token_padding_block=32): False when this subtile's
+        # right 32 rows fall into the NEXT expert's segment -- those rows'
+        # SFC/FP4 stores and the 64-row TMA are replaced by a 32-row TMA of
+        # the in-segment left half only.  Trace-time True for pad=64, so the
+        # historic path const-elides.
+    ):
+        """Steps 2-3: NVFP4 quant (single-level ``norm_const`` or two-level
+        per-token ``inv_gs_pair``) + SF / FP4 smem stores + TMA store.
+
+        Takes the raw tile indices (not ``work_tile_info``) so the online
+        order-free quantizer can store any slice fragment's output."""
         # Step 2: Quant
         self.nvfp4_quant(
-            work_tile_info=work_tile_info,
-            two_token=(token_0_32_pre_quant, token_32_64_pre_quant),
+            tile_m_idx=tile_m_idx,
+            tile_n_idx=tile_n_idx,
+            two_token=two_token,
             topk_scores=topk_scores,
             norm_const=norm_const,
-            intermediate_output_size=cute.size(fc1_output, 1),
+            intermediate_output_size=intermediate_output_size,
             fc1_output_sf=fc1_output_sf,
             subtile_idx=subtile_idx,
+            inv_gs_pair=inv_gs_pair,
+            right_half=right_half,
         )
 
         # Step 3: TMASTG
@@ -1625,35 +2345,75 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_gmem_cta_view = cute.flat_divide(
             fc1_output,
             (self.cta_tile_n, self.cta_tile_m // 2),
-        )[None, None, work_tile_info.tile_n_idx, work_tile_info.tile_m_idx, 0]
+        )[None, None, tile_n_idx, tile_m_idx, 0]
         # (cta_token, cta_intermediate_down) -> (token_64, intermediate_64)
         fc1_gmem_subtile_view = cute.flat_divide(
             fc1_gmem_cta_view,
             (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize),
         )[None, None, subtile_idx, 0]
-        tma_smem_src, tma_gmem_dst = cpasync.tma_partition(
-            self.fc1_tma_atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(fc1_smem, 0, 2),
-            cute.group_modes(fc1_gmem_subtile_view, 0, 2),
-        )
-
-        subtile_bar_id = subtile_idx + cutlass.Int32(
-            SwapABSwigluFp4Epilogue._EpilogueAsyncBarIdBase
-        )
-        tma_ready_to_read_smem_named_barrier = pipeline.NamedBarrier(
-            barrier_id=subtile_bar_id,
-            num_threads=self._EpilogueWarpCnt * 32,
-        )
-        cute.arch.fence_proxy("async.shared", space="cta")
-        if self.warp_idx == subtile_idx:
-            tma_ready_to_read_smem_named_barrier.arrive_and_wait()
-            with cute.arch.elect_one():
-                # if work_tile_info.tile_m_idx * (self.cta_tile_m // 2) < cute.size(fc1_output, 1):
-                cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
+        if right_half:
+            tma_smem_src, tma_gmem_dst = cpasync.tma_partition(
+                self.fc1_tma_atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(fc1_smem, 0, 2),
+                cute.group_modes(fc1_gmem_subtile_view, 0, 2),
+            )
+            subtile_bar_id = subtile_idx + cutlass.Int32(
+                SwapABSwigluFp4Epilogue._EpilogueAsyncBarIdBase
+            )
+            tma_ready_to_read_smem_named_barrier = pipeline.NamedBarrier(
+                barrier_id=subtile_bar_id,
+                num_threads=self._EpilogueWarpCnt * 32,
+            )
+            cute.arch.fence_proxy("async.shared", space="cta")
+            if self.warp_idx == subtile_idx:
+                tma_ready_to_read_smem_named_barrier.arrive_and_wait()
+                with cute.arch.elect_one():
+                    # if work_tile_info.tile_m_idx * (self.cta_tile_m // 2) < cute.size(fc1_output, mode=[1]):
+                    cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
+            else:
+                tma_ready_to_read_smem_named_barrier.arrive()
         else:
-            tma_ready_to_read_smem_named_barrier.arrive()
+            # Boundary subtile (pad=32): only the left 32 rows are in-segment.
+            # Bulk-store them with the 32-row-box atom; the right 32 rows of
+            # this SMEM stage are scratch (their STS was clipped in
+            # nvfp4_quant) and must not touch the next expert's rows.
+            fc1_smem_h = cute.flat_divide(
+                fc1_smem,
+                (
+                    self._EpilogueTokenTileSize // 2,
+                    self._EpilogueFc1IntermediateDownTileSize,
+                ),
+            )[None, None, 0, 0]
+            fc1_gmem_h = cute.flat_divide(
+                fc1_gmem_subtile_view,
+                (
+                    self._EpilogueTokenTileSize // 2,
+                    self._EpilogueFc1IntermediateDownTileSize,
+                ),
+            )[None, None, 0, 0]
+            tma_smem_src_h, tma_gmem_dst_h = cpasync.tma_partition(
+                self.fc1_tma_atom_half32,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(fc1_smem_h, 0, 2),
+                cute.group_modes(fc1_gmem_h, 0, 2),
+            )
+            subtile_bar_id = subtile_idx + cutlass.Int32(
+                SwapABSwigluFp4Epilogue._EpilogueAsyncBarIdBase
+            )
+            tma_ready_to_read_smem_named_barrier = pipeline.NamedBarrier(
+                barrier_id=subtile_bar_id,
+                num_threads=self._EpilogueWarpCnt * 32,
+            )
+            cute.arch.fence_proxy("async.shared", space="cta")
+            if self.warp_idx == subtile_idx:
+                tma_ready_to_read_smem_named_barrier.arrive_and_wait()
+                with cute.arch.elect_one():
+                    cute.copy(self.fc1_tma_atom_half32, tma_smem_src_h, tma_gmem_dst_h)
+            else:
+                tma_ready_to_read_smem_named_barrier.arrive()
 
     @cute.jit
     def alpha_swiglu_clamp(
@@ -1800,7 +2560,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
     @cute.jit
     def nvfp4_quant(
         self,
-        work_tile_info: MoEWorkTileInfo,
+        tile_m_idx: cutlass.Int32,
+        tile_n_idx: cutlass.Int32,
         two_token: Tuple[
             cute.Tensor, cute.Tensor
         ],  # two rmem tensor, each fp32 @ (token_1, intermediate_16)
@@ -1809,6 +2570,11 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         intermediate_output_size: cutlass.Int32,
         fc1_output_sf: cute.Tensor,  # MoE domain (token_this_rank, intermediate_down, 1)
         subtile_idx: cutlass.Int32,
+        inv_gs_pair: Optional[Tuple[cutlass.Float32, cutlass.Float32]] = None,
+        right_half=True,
+        # Boundary clip (token_padding_block=32): False skips the right-half
+        # SFC store and FP4 STS entirely -- those rows belong to the NEXT
+        # expert's segment.  Trace-time True for pad=64 (const-elided).
     ):
         # ``two_token`` are the two post-swiglu, transposed token rmem tensors;
         # each lane holds one token's ``sf_vec_size`` (=16, one NVFP4 SF block)
@@ -1833,11 +2599,11 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         quant = QuantImpl("nvfp4", "regs_in_thread")
 
         intermediate_idx = (
-            work_tile_info.tile_m_idx * (self.cta_tile_m // 2)
+            tile_m_idx * (self.cta_tile_m // 2)
             + self.warp_idx * Nvfp4BlockSize
         )
         subtile_token_start = (
-            work_tile_info.tile_n_idx * self.cta_tile_n
+            tile_n_idx * self.cta_tile_n
             + subtile_idx * self._EpilogueTokenTileSize
         )
         token_idx_pair = (
@@ -1873,33 +2639,51 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 for i in cutlass.range_constexpr(0, n):
                     weighted[i] = tok[i]
 
+            # 1.5) Online-amax two-level path: the per-slice gamax was
+            # resolved by the run_item_online arrive-then-spin protocol
+            # before this block is quantized; this block simply uses its half's
+            # inv_gs = 2688/gamax.  Because gamax >= this block's own amax,
+            # sfc = e4m3(amax/6*inv_gs) never truncates at 448; the
+            # resulting (q, sfc) satisfy q*sfc ~ P/gs, and the fc2 epilogue
+            # merges slice outputs as O += gs * dO.
+            if cutlass.const_expr(inv_gs_pair is not None):
+                nc_eff = inv_gs_pair[half]
+            else:
+                nc_eff = norm_const
+
             # 2) Core block quant: amax + e4m3 sfc + capped/masked acc_scale +
             #    e2m1 cvt. One 16-wide block -> one e2m1 reg tensor + one sfc.
-            fp4_regs, sfc_regs = quant(weighted, norm_const=norm_const)
+            fp4_regs, sfc_regs = quant(weighted, norm_const=nc_eff)
             sfc_e4m3 = sfc_regs[0]
 
             # 3) scale-factor store (predicate const-elided when statically
             #    in-bound, mirroring signal_fc1_done's intermediate predicate).
-            if cutlass.const_expr(
-                self.static_expert_shape is None
-                or self.intermediate_downproj % self.cluster_tile_intermediate_downproj
-                != 0
-            ):
-                if intermediate_idx < intermediate_output_size:
+            #    Boundary clip: skipped for the out-of-segment right half.
+            if half == 0 or right_half:
+                if cutlass.const_expr(
+                    self.static_expert_shape is None
+                    or self.intermediate_downproj % self.cluster_tile_intermediate_downproj
+                    != 0
+                ):
+                    if intermediate_idx < intermediate_output_size:
+                        fc1_output_sf[token_idx_pair[half], intermediate_idx, 0] = sfc_e4m3
+                else:
                     fc1_output_sf[token_idx_pair[half], intermediate_idx, 0] = sfc_e4m3
-            else:
-                fc1_output_sf[token_idx_pair[half], intermediate_idx, 0] = sfc_e4m3
 
             # 4) STS.64 the e2m1 into this subtile's shared output stage.
             # ((1, 16), (token_tile_size, warp_cnt)) -> (16)
-            smem_thread_row = smem_tiled[
-                (0, None), (self.lane_idx + 32 * half, self.warp_idx)
-            ]
-            cute.copy(
-                fp4_copy_atom,
-                cute.coalesce(fp4_regs),
-                cute.coalesce(smem_thread_row),
-            )
+            #    Boundary clip: skipped for the out-of-segment right half
+            #    (its SMEM rows are stored via nothing -- the TMA step only
+            #    bulk-copies the left 32 rows).
+            if half == 0 or right_half:
+                smem_thread_row = smem_tiled[
+                    (0, None), (self.lane_idx + 32 * half, self.warp_idx)
+                ]
+                cute.copy(
+                    fp4_copy_atom,
+                    cute.coalesce(fp4_regs),
+                    cute.coalesce(smem_thread_row),
+                )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1936,6 +2720,12 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         self.fc2_output = fc2_output
         self.token_comm_args = token_comm_args
         self.optional_epi_args = optional_epi_args
+        # Online-amax two-level quant: number of k1 slices (= gs_ws columns)
+        # and the per-(token, slice) gs snapshots consumed by the fc2 merge.
+        if cutlass.const_expr(optional_epi_args.gs_ws is not None):
+            self.online_k1_cnt = cute.size(optional_epi_args.gs_ws, mode=[1])
+        else:
+            self.online_k1_cnt = 0
         if cutlass.const_expr(base.fc2_use_bulk):
             wire_dtype = base.combine_format.act_dtype
             fc2_smem_rows = 32
@@ -2067,6 +2857,189 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             epi_tid=self.tidx,
             combine_format=self.combine_format,
         ).prefetch()
+
+    @cute.jit
+    def run_online(
+        self,
+        work_tile_info: MoEWorkTileInfo,
+        tmem_acc_tensor: cute.Tensor,  # (cta_tile_m, cta_tile_n, num_acc_stage)
+        acc_pipeline,
+        acc_consumer_state,
+    ):
+        """Online-amax two-level fc2: merge per-k1-slice partial products.
+
+        The MMA warp committed one acc stage per k1 slice (each slice's MMA
+        ran with ACCUMULATE=False), so slice s's stage holds
+        ``dO_s = (q_s * bs_s) @ W2_s ~ P_s / gs_s``.  The reference merge is
+        ``O = fc2_alpha * sum_s gs_s * dO_s``.  All k1_cnt slices' raw fp32
+        quadrant fragments of a subtile are LDTM'd first, weighted-merged in
+        fp32 (per-element gs from gs_ws), and only then rounded to bf16 once
+        through the shared f2fp -> reorder -> store pipeline (a per-slice bf16
+        pre-round was measured to be the dominant residual error: host replay
+        of it reproduces the device mismatch set 100%).
+
+        Consumes acc_consumer_state self.online_k1_cnt times; the caller
+        advances the shared state by the same count.
+        """
+        if cutlass.const_expr(
+            self.optional_epi_args.fc2_alpha is None
+            or self.optional_epi_args.gs_ws is None
+        ):
+            raise ValueError("run_online requires fc2_alpha and gs_ws")
+        k1_cnt = self.base.online_k1_cnt
+        assert k1_cnt > 0
+        alpha_val = self.optional_epi_args.fc2_alpha[work_tile_info.expert_idx]
+        gs_ws = self.optional_epi_args.gs_ws
+
+        # Per-slice consumer states (index/phase tracked per stage).
+        slice_states = [acc_consumer_state]
+        for _ in cutlass.range_constexpr(k1_cnt - 1):
+            nxt = slice_states[-1].clone()
+            nxt.advance()
+            slice_states.append(nxt)
+
+        iket.range_push("fc2_epi_online")
+        # Block on every slice's acc stage (peek_ready optimization skipped:
+        # the per-slice stages make the single peek token ambiguous).
+        for s in cutlass.range_constexpr(k1_cnt):
+            acc_pipeline.consumer_wait(slice_states[s])
+
+        fc2_output_router = self._make_output_router(work_tile_info)
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        # gs_ws rows follow the DENSE-physical token-row convention (same as
+        # the fc1 writer's token_block_base and this router's
+        # task_tile_data_row_start): expert base + this tile's token-block
+        # offset.  Omitting tile_n_idx * cta_tile_n reads expert base rows
+        # for every block, which is only harmless while each expert owns a
+        # single token block (balanced routing) -- imbalanced routing puts
+        # the wrong slice weights on every 2nd+ block (official validation
+        # fail + relF degradation observed at Dirichlet routing).
+        row_base = (
+            work_tile_info.cumulative_data_physical_row
+            + work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
+        )
+
+        # STG raw-quadrant -> token mapping (validated by smoke): the element
+        # at (quadrant q, elem i) of this thread's raw fp32 fragment belongs to
+        # token ``(q//2)*32 + 2*i + (lane//2)%2`` within the 64-token subtile
+        # (see TmemTranspose16x32 input distribution: view col = token for fc2).
+        lane_par = (self.lane_idx // 2) % 2
+
+        for subtile_idx in cutlass.range(self.subtile_cnt, unroll=1):
+            if subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) < valid_tokens:
+                # Preload this subtile's gs weights ONCE, deduplicated across
+                # quadrants: the token of (q, i) is (q//2)*32 + 2*i + lane_par,
+                # so the four quadrants use only two distinct 16-token sets
+                # (q=0,1 -> half 0; q=2,3 -> half 1).  Gathering inside the
+                # merge loop costs 4x more scalar LDGs and serializes on
+                # L1TEX latency (ncu: 72% long scoreboard at 8 warps/SM).
+                aw = []
+                for half in cutlass.range_constexpr(2):
+                    half_w = []
+                    for i in cutlass.range_constexpr(16):
+                        tok = (
+                            cutlass.Int32(subtile_idx) * self._EpilogueTokenTileSize
+                            + half * 32
+                            + 2 * i
+                            + lane_par
+                        )
+                        s_w = []
+                        if cutlass.const_expr(k1_cnt == 2):
+                            # gs_ws rows are (token, k1_cnt) contiguous, so
+                            # both slices load in one 64-bit LDG.
+                            gs_pair_ptr = cute.make_ptr(
+                                cutlass.Float32,
+                                (
+                                    gs_ws.iterator + (row_base + tok) * k1_cnt
+                                ).toint(),
+                                AddressSpace.gmem,
+                                assumed_align=8,
+                            )
+                            gs_pair = cute.make_rmem_tensor((2,), cutlass.Float32)
+                            cute.copy(
+                                cute.make_copy_atom(
+                                    cute.nvgpu.CopyUniversalOp(),
+                                    cutlass.Float32,
+                                    num_bits_per_copy=64,
+                                ),
+                                cute.make_tensor(
+                                    gs_pair_ptr, cute.make_layout((2,))
+                                ),
+                                gs_pair,
+                            )
+                            s_w.append(alpha_val * gs_pair[0])
+                            s_w.append(alpha_val * gs_pair[1])
+                        else:
+                            for s in cutlass.range_constexpr(k1_cnt):
+                                s_w.append(
+                                    alpha_val * gs_ws[row_base + tok, s]
+                                )
+                        half_w.append(s_w)
+                    aw.append(half_w)
+
+                # fp32 weighted merge per raw element; single bf16 round
+                # later.  One slice's quadrants are LDTM'd at a time and
+                # accumulated into the merged fragments (bounds live regs).
+                merged_quads = []
+                for q in cutlass.range_constexpr(4):
+                    m = cute.make_rmem_tensor((16,), cutlass.Float32)
+                    for i in cutlass.range_constexpr(16):
+                        m[i] = cutlass.Float32(0.0)
+                    merged_quads.append(m)
+                for s in cutlass.range_constexpr(k1_cnt):
+                    acc_s = tmem_acc_tensor[(None, None, slice_states[s].index)]
+                    tiled = cute.flat_divide(
+                        acc_s,
+                        (
+                            self._EpilogueFc2HiddenTileSize,
+                            self._EpilogueTokenTileSize,
+                        ),
+                    )[None, None, 0, None]
+                    subtile_s = tiled[None, None, subtile_idx]
+                    raws_s = self.process_pipeline.tmem_acc_load(
+                        tmem_subtile_tensor=subtile_s,
+                        epi=self,
+                    )
+                    for q in cutlass.range_constexpr(4):
+                        half = q // 2
+                        for i in cutlass.range_constexpr(16):
+                            merged_quads[q][i] = merged_quads[q][i] + (
+                                raws_s[q][i] * aw[half][i][s]
+                            )
+                # Recompute slice 0's subtile view for the reorder scratch
+                # (avoids a None/Tensor type-join across the staged loop).
+                acc_0 = tmem_acc_tensor[(None, None, slice_states[0].index)]
+                tiled_0 = cute.flat_divide(
+                    acc_0,
+                    (
+                        self._EpilogueFc2HiddenTileSize,
+                        self._EpilogueTokenTileSize,
+                    ),
+                )[None, None, 0, None]
+                subtile_view0 = tiled_0[None, None, subtile_idx]
+
+                casted = self.process_pipeline.f2fp(
+                    *merged_quads, alpha_val=None
+                )
+                merged = self.process_pipeline.post_f2fp_reorder(
+                    casted=casted,
+                    tmem_subtile_view=subtile_view0,
+                )
+                self.process_pipeline.store_function(
+                    epi=self,
+                    subtile=merged,
+                    subtile_idx=subtile_idx,
+                    fc2_output_router=fc2_output_router,
+                )
+
+        # All slices drained; release every stage (order irrelevant),
+        # then advance the caller's state past all k1_cnt consumed stages
+        # (the run() loop advances only on the non-online paths).
+        cute.arch.fence_view_async_tmem_load()
+        for s in cutlass.range_constexpr(k1_cnt):
+            acc_pipeline.consumer_release(slice_states[s])
+        for _ in cutlass.range_constexpr(k1_cnt):
+            acc_consumer_state.advance()
 
     @cute.jit
     def __call__(
@@ -2874,13 +3847,13 @@ def fc2_redg_post_f2fp_reorder(
     out_as_i32 = cute.recast_tensor(out, cutlass.Float32)
     # (32, 64)
     tmem_subtile_warp_local = cute.flat_divide(
-        tmem_subtile_view, (32, cute.size(tmem_subtile_view, 1))
+        tmem_subtile_view, (32, cute.size(tmem_subtile_view, mode=[1]))
     )[None, None, 0, 0]
     # (16, 16, 16dp_group, token_32_groups). Note, this tmem can provide 2x cols since the original is bf16.
     tmem_subtile_divided_by_token_group_divided_by_16dp = cute.flat_divide(
         tmem_subtile_warp_local, (16, 16)
     )
-    for i in cutlass.range_constexpr(cute.size(natural_divided_by_token32_16dp, 1)):
+    for i in cutlass.range_constexpr(cute.size(natural_divided_by_token32_16dp, mode=[1])):
         current_sttm_src = cute.recast_tensor(
             natural_divided_by_token32_16dp[None, i], cutlass.Float32
         )

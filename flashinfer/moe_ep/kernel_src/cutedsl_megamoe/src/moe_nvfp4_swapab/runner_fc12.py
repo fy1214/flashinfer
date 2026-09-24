@@ -178,6 +178,44 @@ class SwapABSwigluFp4Fc12Tester(Fc12TesterBase):
             torch.randint(1, 5, (experts,), device="cuda").to(torch.float32) * 0.5
         )
 
+        # -- online-amax two-level quantization workspaces (kernel-written) --
+        # ``gs_ws``: per-(token, k1-slice) snapshot gs = slice_amax/2688,
+        # written by the slice's last-arriver quantizer; read back by the
+        # reference so it replays the exact scales the kernel used.
+        # ``slice_amax_ws``: per-(token, k1-slice) published amax (device
+        # atomicMax targets).  ``arrive_cnt``: per-(token block slot,
+        # k1-slice) arrival counters; slot layout mirrors the fc1_done
+        # counter (slot = cumulative_token_block_count + tile_n_idx), one
+        # counter per k1 slice.  ``fc1_p_ws``: raw post-SwiGLU P staging
+        # (fp32, global token rows x intermediate_down) that every item
+        # writes and the last-arriver re-reads to quantize the whole slice
+        # with one slice-uniform gs.  All zero-initialized by the runner
+        # before every launch.
+        k1_width = self.impl.mma_tiler_mnk[2]
+        k1_cnt = -(-(intermediate // 2) // k1_width)
+        mma_tiler_n = self.impl.mma_tiler_mnk[1]
+        counter_slots = (
+            data_total_rows + mma_tiler_n - 1
+        ) // mma_tiler_n + experts
+        # Row counts are padded to the token-block slot upper bound (the
+        # kernel writes by global token-block base, so the tail block can
+        # touch rows past data_total_rows).
+        ws_rows = counter_slots * mma_tiler_n
+        self.gs_ws = torch.zeros(
+            (ws_rows, k1_cnt), dtype=torch.float32, device="cuda"
+        )
+        self.slice_amax_ws = torch.zeros(
+            (ws_rows, k1_cnt), dtype=torch.float32, device="cuda"
+        )
+        self.arrive_cnt = torch.zeros(
+            (counter_slots * k1_cnt,), dtype=torch.int32, device="cuda"
+        )
+        self.fc1_p_ws = torch.zeros(
+            (ws_rows, intermediate // 2),
+            dtype=torch.float32,
+            device="cuda",
+        )
+
     def _alloc_fc2_output(self, data_total_rows: int) -> None:
         # 0xFF byte fill: bf16 0xFFFF = NaN, fp16 0xFFFF = NaN -- kernel
         # output overwriting valid rows is easy to distinguish from "kernel
@@ -213,6 +251,24 @@ class SwapABSwigluFp4Fc12Tester(Fc12TesterBase):
             return fc2_fp32 * topk_slice.unsqueeze(-1)
         return fc2_fp32
 
+    def _extra_runtime_kwargs(self) -> dict:
+        """Inject the online-amax workspaces as cute tensors (NVFP4 only)."""
+        if not self._online_amax_enabled():
+            return {}
+        import cutlass.torch as cutlass_torch
+
+        def _to_cute(tensor: torch.Tensor):
+            cute_tensor = cutlass_torch.from_dlpack(tensor, assumed_align=4)
+            leading_dim = cutlass_torch.get_leading_dim(tensor)
+            return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+
+        return {
+            "gs_ws": _to_cute(self.gs_ws),
+            "slice_amax_ws": _to_cute(self.slice_amax_ws),
+            "arrive_cnt": _to_cute(self.arrive_cnt),
+            "fc1_p_ws": _to_cute(self.fc1_p_ws),
+        }
+
     # ------------------------------------------------------------------
     # Kind hooks: kernel + validation
     # ------------------------------------------------------------------
@@ -229,6 +285,11 @@ class SwapABSwigluFp4Fc12Tester(Fc12TesterBase):
             apply_topk_in_fc1=self.misc.ref_compute_graph == "deepgemm",
             gate_up_clamp=self.problem.gate_up_clamp,
             epi_flag_batch=self.impl.epi_flag_batch,
+            online_k1_cnt=(
+                -(-(self.problem.intermediate // 2) // self.impl.mma_tiler_mnk[2])
+                if self._online_amax_enabled()
+                else 0
+            ),
         )
 
     def _fc2_tolerance(self) -> Tuple[float, float]:

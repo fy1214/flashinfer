@@ -696,3 +696,42 @@ def nvfp4_quantize_per_block_16(
     scaled = c_swiglu * acc_scale.unsqueeze(-1).expand_as(blocked).reshape(M, N)
     c_fp4 = _pack_f32_to_fp4(scaled)
     return c_fp4, sfc_fp8
+
+
+def nvfp4_quantize_per_block_16_gs(
+    c_swiglu: torch.Tensor,
+    nc_vec: torch.Tensor,  # (M,) fp32 per-token second-level scale (= 2688/gamax)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Online-amax two-level NVFP4 quantize along the trailing dim.
+
+    Mirrors the device epilogue's per-block math with ``norm_const :=
+    nc_vec`` (so ``sfc = e4m3(amax/6*nc)`` never truncates at 448 and
+    ``q*sfc ~ P/gs``), keeping the exact op order of
+    :func:`nvfp4_quantize_per_block_16` so boundary ties line up.
+    """
+    M, N = c_swiglu.shape
+    if N % Nvfp4BlockSize != 0:
+        raise ValueError(
+            f"Trailing dim ({N}) must be a multiple of sf_vec_size ({Nvfp4BlockSize})."
+        )
+    if nc_vec.shape != (M,):
+        raise ValueError(f"nc_vec must be ({M},), got {tuple(nc_vec.shape)}")
+
+    blocked = c_swiglu.view(M, N // Nvfp4BlockSize, Nvfp4BlockSize)
+    absmax = blocked.abs().amax(dim=-1)
+    sfc_fp32 = absmax * Nvfp4E2M1RcpLimit * nc_vec.unsqueeze(-1)
+    sfc_fp32_clamped = torch.clamp(sfc_fp32, min=-Fp8E4M3FNMax, max=Fp8E4M3FNMax)
+    sfc_fp8 = sfc_fp32_clamped.to(Nvfp4ScaleDtype)
+    sfc_fp32_rt = sfc_fp8.to(torch.float32)
+
+    fp32_max = torch.finfo(torch.float32).max
+    acc_scale = nc_vec.unsqueeze(-1) * _rcp_approx_ftz_f32_cuda(sfc_fp32_rt)
+    acc_scale = torch.nan_to_num(
+        acc_scale, nan=fp32_max, posinf=fp32_max, neginf=fp32_max
+    )
+    acc_scale = torch.clamp(acc_scale, max=fp32_max)
+    acc_scale = torch.where(sfc_fp32_rt > 0, acc_scale, torch.zeros_like(acc_scale))
+
+    scaled = c_swiglu * acc_scale.unsqueeze(-1).expand_as(blocked).reshape(M, N)
+    c_fp4 = _pack_f32_to_fp4(scaled)
+    return c_fp4, sfc_fp8

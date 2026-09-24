@@ -90,6 +90,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
+        online_k1_cnt: int = 0,  # >0: online-amax two-level quant on; #k1 slices
     ) -> None:
         if not force_static_sched:
             raise NotImplementedError(
@@ -138,6 +139,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.apply_topk_in_fc1 = apply_topk_in_fc1
         self.gate_up_clamp = gate_up_clamp
         self.epi_flag_batch = epi_flag_batch
+        self.online_k1_cnt = int(online_k1_cnt)
 
         self._validate_mma_tiler_and_cluster_shape()
         self.mma_tiler = mma_tiler_mnk
@@ -390,6 +392,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             allow_overlap_acc=True,
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
+            online_k1_cnt=self.online_k1_cnt,
+            token_padding_block=self.token_padding_block,
         )
 
         if self.num_sched_stages is None:
@@ -761,6 +765,11 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         fc1_alpha: Optional[cute.Tensor] = None,
         fc2_alpha: Optional[cute.Tensor] = None,
         fc1_norm_const: Optional[cute.Tensor] = None,
+        # ── Online-amax two-level quant workspace ────────────────────────
+        gs_ws: Optional[cute.Tensor] = None,  # (token_sum_padded, k1_cnt) Float32
+        slice_amax_ws: Optional[cute.Tensor] = None,  # (token_sum_padded, k1_cnt) Float32
+        arrive_cnt: Optional[cute.Tensor] = None,  # (token_block_slots * k1_cnt,) Int32
+        fc1_p_ws: Optional[cute.Tensor] = None,  # (token_sum_padded, intermediate_down) Float32
         # ── Optional dynamic load-balance counter ────────────────────────
         load_balance_counter: Optional[cute.Tensor] = None,
         # ── Sizes-mode per-expert token count (MegaMoE path) ─────────────
@@ -1105,6 +1114,27 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             fc1_output_smem_layout,
             fc1_output_epi_tile,
         )
+        # 32-row-box variant for token_padding_block=32 boundary subtiles:
+        # bulk-stores only the in-segment left half of a subtile that would
+        # otherwise straddle into the NEXT expert's rows.  Same gmem tensor,
+        # (32, down_tile) box; the SMEM side is the top half of the staged
+        # layout, matching the rows nvfp4_quant STS'd (right-half STS is
+        # clipped in that case).
+        fc1_output_epi_tile_half = (
+            self.epilogue._EpilogueTokenTileSize // 2,
+            self.epilogue._EpilogueFc1IntermediateDownTileSize,
+        )
+        fc1_output_smem_layout_half = self.epilogue.fc1_staged_smem_layout(
+            1,
+            without_stage_mode=True,
+            token_rows=fc1_output_epi_tile_half[0],
+        )
+        tma_atom_fc1_output_half32, tma_tensor_fc1_output_half32 = cpasync.make_tiled_tma_atom(
+            fc1_output_tma_op,
+            fc1_output_gemm,
+            fc1_output_smem_layout_half,
+            fc1_output_epi_tile_half,
+        )
 
         # fc1 SFC GMEM tensor (= fc1_output_sf user view).  No TMA atom; it is
         # per-thread STG.
@@ -1246,6 +1276,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             tma_tensor_activation_sf,
             tma_atom_fc1_output,
             tma_tensor_fc1_output,
+            tma_atom_fc1_output_half32,
             # fc2 TMA atoms / tensors
             tma_atom_fc2_weight,
             tma_tensor_fc2_weight,
@@ -1277,6 +1308,11 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
+            # Online-amax two-level workspaces (None = single-level path)
+            gs_ws,
+            slice_amax_ws,
+            arrive_cnt,
+            fc1_p_ws,
             # Scheduling (``offs`` now lives inside ``sched_params`` as
             # ``expert_token_prefix_sum``; the inner kernel reads it via
             # ``self.params`` and no longer needs a separate copy).
@@ -1314,6 +1350,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         tma_tensor_activation_sf: cute.Tensor,
         tma_atom_fc1_output: cute.CopyAtom,
         tma_tensor_fc1_output: cute.Tensor,
+        tma_atom_fc1_output_half32: cute.CopyAtom,
         # fc2 TMA atoms / tensors
         tma_atom_fc2_weight: cute.CopyAtom,
         tma_tensor_fc2_weight: cute.Tensor,
@@ -1346,6 +1383,21 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         fc1_alpha: Optional[cute.Tensor],
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
+        # Online-amax two-level workspaces (None = single-level path).
+        # ``gs_ws``: (token_sum_padded, k1_cnt) fp32 per-(token, k1-slice)
+        # snapshot gs = slice_amax/2688 (written by the last-arriver
+        # quantizer; see ``SwapABFc1Epilogue.run_item_online``).
+        # ``slice_amax_ws``: (token_sum_padded, k1_cnt) fp32 per-slice
+        # published amax (atomicMax per (row, slice), zeroed before launch).
+        # ``arrive_cnt``: (token_block_slots * k1_cnt,) Int32 per-(slot,
+        # slice) arrival counters; the unique last arriver of a slice is the
+        # one whose atomic_add returns group_size - 1.
+        # ``fc1_p_ws``: (token_sum_padded, intermediate_down) fp32 raw
+        # post-SwiGLU P staging for the last-arriver re-read.
+        gs_ws: Optional[cute.Tensor],
+        slice_amax_ws: Optional[cute.Tensor],
+        arrive_cnt: Optional[cute.Tensor],
+        fc1_p_ws: Optional[cute.Tensor],
         # Scheduling (the per-expert token range tensor is carried inside
         # ``sched_params`` as ``expert_token_prefix_sum`` or
         # ``expert_token_sizes`` -- never passed separately).
@@ -2185,115 +2237,198 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 else:
                     acc_stage_index = acc_producer_state.index
 
-                if is_leader_cta:
-                    tCtAcc = tCtAcc_base[(None, None, None, acc_stage_index)]
+                if cutlass.const_expr(self.online_k1_cnt > 0):
+                    run_online_fc2 = not is_phase_linear1
+                else:
+                    run_online_fc2 = False
 
-                    ab_consumer.reset()
-                    peek_ab_full_status = cutlass.Boolean(1)
-                    iket.range_push("mma_acquire")
-                    peek_ab_full_status = ab_consumer.try_wait()
-                    acc_pipeline.producer_acquire(acc_producer_state)
-                    iket.range_pop()
+                if run_online_fc2:
+                    # ── Online-amax two-level fc2 ──────────────────────────
+                    # One acc stage per k1 slice (k-tile == slice): every
+                    # slice's MMA runs ACCUMULATE=False (k_tile_idx=0) so
+                    # stage s holds dO_s = (q_s*bs_s) @ W2_s ~ P_s / gs_s.
+                    # The epilogue merges O = alpha * sum_s gs_s * dO_s.
+                    # AB-pipeline consumption order is unchanged; the
+                    # extra acc stage (+1 spare) keeps the next work tile's
+                    # MMA overlapped with this tile's multi-stage drain.
+                    if is_leader_cta:
+                        ab_consumer.reset()
+                        peek_ab_full_status = cutlass.Boolean(1)
+                        iket.range_push("mma_acquire")
+                        peek_ab_full_status = ab_consumer.try_wait()
+                        iket.range_pop()
 
-                    # Apply TMEM pointer offset hack when mma_tiler_n == 64.
-                    tCtSFB_mma = tCtSFB
-                    if cutlass.const_expr(self.mma_tiler[1] == 64):
-                        sfb_shift = cutlass.Int32(
-                            (work_tile_info.tile_n_idx % cutlass.Int32(2))
-                            * cutlass.Int32(2)
-                        )
-                        shifted_sfb_ptr = cute.recast_ptr(
-                            acc_tmem_ptr
-                            + self.num_accumulator_tmem_cols
-                            + self.num_sfa_tmem_cols
-                            + sfb_shift,
-                            dtype=self.sf_dtype,
-                        )
-                        tCtSFB_mma = cute.make_tensor(shifted_sfb_ptr, tCtSFB_layout)
+                        # Apply TMEM pointer offset hack when mma_tiler_n == 64.
+                        tCtSFB_mma = tCtSFB
+                        if cutlass.const_expr(self.mma_tiler[1] == 64):
+                            sfb_shift = cutlass.Int32(
+                                (work_tile_info.tile_n_idx % cutlass.Int32(2))
+                                * cutlass.Int32(2)
+                            )
+                            shifted_sfb_ptr = cute.recast_ptr(
+                                acc_tmem_ptr
+                                + self.num_accumulator_tmem_cols
+                                + self.num_sfa_tmem_cols
+                                + sfb_shift,
+                                dtype=self.sf_dtype,
+                            )
+                            tCtSFB_mma = cute.make_tensor(
+                                shifted_sfb_ptr, tCtSFB_layout
+                            )
 
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                    # CuTe-DSL 4.5.2 mainloop WAR (cutedsl_megamoe MR!27; see
-                    # TUNING.md "Follow-up 2026-07-22"): 4.5.2's codegen
-                    # mishandles the data-dependent peek guard inside the
-                    # K-loop (`if k_tile + 1 < cnt: try_wait()`), costing
-                    # 34-54% kernel time vs 4.6.1. Peeling the last k-tile out
-                    # of the loop makes the in-loop try_wait unconditional
-                    # (the peeled tail consumes the final peek), which
-                    # restores full 4.6.1 parity. const_expr-gated on exactly
-                    # 4.5.2 so newer runtimes keep the original loop shape;
-                    # delete both peel branches when 4.5.2 support is dropped.
-                    cutedsl_452_ver_war = cute_dsl_version == Version("4.5.2")
-                    k_tile_loop_cnt = k_tile_cnt
-                    if cutlass.const_expr(cutedsl_452_ver_war):
-                        k_tile_loop_cnt = k_tile_loop_cnt - 1
-
-                    for k_tile in cutlass.range(0, k_tile_loop_cnt, 1, unroll=1):
-                        handle = ab_consumer.wait_and_advance(peek_ab_full_status)
-                        if cutlass.const_expr(cutedsl_452_ver_war):
-                            peek_ab_full_status = ab_consumer.try_wait()
-                        else:
-                            if k_tile + 1 < k_tile_loop_cnt:
+                        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                            acc_pipeline.producer_acquire(acc_producer_state)
+                            tCtAcc = tCtAcc_base[
+                                (None, None, None, acc_producer_state.index)
+                            ]
+                            handle = ab_consumer.wait_and_advance(
+                                peek_ab_full_status
+                            )
+                            if k_tile + 1 < k_tile_cnt:
                                 peek_ab_full_status = ab_consumer.try_wait()
 
-                        s2t_stage_coord = (None, None, None, None, handle.index)
-                        cute.copy(
-                            tiled_copy_s2t_sfa,
-                            tCsSFA_compact_s2t[s2t_stage_coord],
-                            tCtSFA_compact_s2t,
-                        )
-                        cute.copy(
-                            tiled_copy_s2t_sfb,
-                            tCsSFB_compact_s2t[s2t_stage_coord],
-                            tCtSFB_compact_s2t,
-                        )
+                            s2t_stage_coord = (None, None, None, None, handle.index)
+                            cute.copy(
+                                tiled_copy_s2t_sfa,
+                                tCsSFA_compact_s2t[s2t_stage_coord],
+                                tCtSFA_compact_s2t,
+                            )
+                            cute.copy(
+                                tiled_copy_s2t_sfb,
+                                tCsSFB_compact_s2t[s2t_stage_coord],
+                                tCtSFB_compact_s2t,
+                            )
 
-                        # tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                        tile_crd = (None, None, None, handle.index)
-                        dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
-                            acc_tensor=tCtAcc,
-                            a_frag_tile=tCrA[tile_crd],
-                            b_frag_tile=tCrB[tile_crd],
-                            sfa_tensor=tCtSFA,
-                            sfb_tensor=tCtSFB_mma,
-                            k_tile_idx=k_tile,
-                            valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
-                            mma_tiler_mnk=self.mma_tiler_mnk,
-                        )
-                        handle.release()
+                            tile_crd = (None, None, None, handle.index)
+                            dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
+                                acc_tensor=tCtAcc,
+                                a_frag_tile=tCrA[tile_crd],
+                                b_frag_tile=tCrB[tile_crd],
+                                sfa_tensor=tCtSFA,
+                                sfb_tensor=tCtSFB_mma,
+                                k_tile_idx=0,  # fresh accumulator per slice
+                                valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
+                                mma_tiler_mnk=self.mma_tiler_mnk,
+                            )
+                            handle.release()
+                            acc_pipeline.producer_commit(acc_producer_state)
+                            acc_producer_state.advance()
+                    else:
+                        # Non-leader CTA only tracks the producer state.
+                        for _ in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                            acc_producer_state.advance()
+                else:
+                    if is_leader_cta:
+                        tCtAcc = tCtAcc_base[(None, None, None, acc_stage_index)]
 
-                    if cutlass.const_expr(cutedsl_452_ver_war):
-                        # 4.5.2 WAR peeled last k-tile (rationale above): same
-                        # body as the loop, consuming the final try_wait peek.
-                        handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+                        ab_consumer.reset()
+                        peek_ab_full_status = cutlass.Boolean(1)
+                        iket.range_push("mma_acquire")
+                        peek_ab_full_status = ab_consumer.try_wait()
+                        acc_pipeline.producer_acquire(acc_producer_state)
+                        iket.range_pop()
 
-                        s2t_stage_coord = (None, None, None, None, handle.index)
-                        cute.copy(
-                            tiled_copy_s2t_sfa,
-                            tCsSFA_compact_s2t[s2t_stage_coord],
-                            tCtSFA_compact_s2t,
-                        )
-                        cute.copy(
-                            tiled_copy_s2t_sfb,
-                            tCsSFB_compact_s2t[s2t_stage_coord],
-                            tCtSFB_compact_s2t,
-                        )
+                        # Apply TMEM pointer offset hack when mma_tiler_n == 64.
+                        tCtSFB_mma = tCtSFB
+                        if cutlass.const_expr(self.mma_tiler[1] == 64):
+                            sfb_shift = cutlass.Int32(
+                                (work_tile_info.tile_n_idx % cutlass.Int32(2))
+                                * cutlass.Int32(2)
+                            )
+                            shifted_sfb_ptr = cute.recast_ptr(
+                                acc_tmem_ptr
+                                + self.num_accumulator_tmem_cols
+                                + self.num_sfa_tmem_cols
+                                + sfb_shift,
+                                dtype=self.sf_dtype,
+                            )
+                            tCtSFB_mma = cute.make_tensor(shifted_sfb_ptr, tCtSFB_layout)
 
-                        tile_crd = (None, None, None, handle.index)
-                        dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
-                            acc_tensor=tCtAcc,
-                            a_frag_tile=tCrA[tile_crd],
-                            b_frag_tile=tCrB[tile_crd],
-                            sfa_tensor=tCtSFA,
-                            sfb_tensor=tCtSFB_mma,
-                            k_tile_idx=k_tile_cnt - 1,
-                            valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
-                            mma_tiler_mnk=self.mma_tiler_mnk,
-                        )
-                        handle.release()
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                    acc_pipeline.producer_commit(acc_producer_state)
-                acc_producer_state.advance()
+                        # CuTe-DSL 4.5.2 mainloop WAR (cutedsl_megamoe MR!27; see
+                        # TUNING.md "Follow-up 2026-07-22"): 4.5.2's codegen
+                        # mishandles the data-dependent peek guard inside the
+                        # K-loop (`if k_tile + 1 < cnt: try_wait()`), costing
+                        # 34-54% kernel time vs 4.6.1. Peeling the last k-tile out
+                        # of the loop makes the in-loop try_wait unconditional
+                        # (the peeled tail consumes the final peek), which
+                        # restores full 4.6.1 parity. const_expr-gated on exactly
+                        # 4.5.2 so newer runtimes keep the original loop shape;
+                        # delete both peel branches when 4.5.2 support is dropped.
+                        cutedsl_452_ver_war = cute_dsl_version == Version("4.5.2")
+                        k_tile_loop_cnt = k_tile_cnt
+                        if cutlass.const_expr(cutedsl_452_ver_war):
+                            k_tile_loop_cnt = k_tile_loop_cnt - 1
+
+                        for k_tile in cutlass.range(0, k_tile_loop_cnt, 1, unroll=1):
+                            handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+                            if cutlass.const_expr(cutedsl_452_ver_war):
+                                peek_ab_full_status = ab_consumer.try_wait()
+                            else:
+                                if k_tile + 1 < k_tile_loop_cnt:
+                                    peek_ab_full_status = ab_consumer.try_wait()
+
+                            s2t_stage_coord = (None, None, None, None, handle.index)
+                            cute.copy(
+                                tiled_copy_s2t_sfa,
+                                tCsSFA_compact_s2t[s2t_stage_coord],
+                                tCtSFA_compact_s2t,
+                            )
+                            cute.copy(
+                                tiled_copy_s2t_sfb,
+                                tCsSFB_compact_s2t[s2t_stage_coord],
+                                tCtSFB_compact_s2t,
+                            )
+
+                            # tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                            tile_crd = (None, None, None, handle.index)
+                            dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
+                                acc_tensor=tCtAcc,
+                                a_frag_tile=tCrA[tile_crd],
+                                b_frag_tile=tCrB[tile_crd],
+                                sfa_tensor=tCtSFA,
+                                sfb_tensor=tCtSFB_mma,
+                                k_tile_idx=k_tile,
+                                valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
+                                mma_tiler_mnk=self.mma_tiler_mnk,
+                            )
+                            handle.release()
+
+                        if cutlass.const_expr(cutedsl_452_ver_war):
+                            # 4.5.2 WAR peeled last k-tile (rationale above): same
+                            # body as the loop, consuming the final try_wait peek.
+                            handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+
+                            s2t_stage_coord = (None, None, None, None, handle.index)
+                            cute.copy(
+                                tiled_copy_s2t_sfa,
+                                tCsSFA_compact_s2t[s2t_stage_coord],
+                                tCtSFA_compact_s2t,
+                            )
+                            cute.copy(
+                                tiled_copy_s2t_sfb,
+                                tCsSFB_compact_s2t[s2t_stage_coord],
+                                tCtSFB_compact_s2t,
+                            )
+
+                            tile_crd = (None, None, None, handle.index)
+                            dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
+                                acc_tensor=tCtAcc,
+                                a_frag_tile=tCrA[tile_crd],
+                                b_frag_tile=tCrB[tile_crd],
+                                sfa_tensor=tCtSFA,
+                                sfb_tensor=tCtSFB_mma,
+                                k_tile_idx=k_tile_cnt - 1,
+                                valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
+                                mma_tiler_mnk=self.mma_tiler_mnk,
+                            )
+                            handle.release()
+
+                        acc_pipeline.producer_commit(acc_producer_state)
+                    acc_producer_state.advance()
 
                 iket.range_pop()
 
@@ -2329,6 +2464,10 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 topk_scores=(
                     topk_scores if cutlass.const_expr(self.apply_topk_in_fc1) else None
                 ),
+                gs_ws=gs_ws,
+                slice_amax_ws=slice_amax_ws,
+                arrive_cnt=arrive_cnt,
+                fc1_p_ws=fc1_p_ws,
             )
 
             self.epilogue.run(
@@ -2345,6 +2484,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 tidx=tidx,
                 optional_epi_args=optional_epi_args,
                 token_comm_args=token_comm_args,
+                tma_atom_fc1_output_half32=tma_atom_fc1_output_half32,
             )
             cute.arch.fence_acq_rel_sys()
             tmem.relinquish_alloc_permit()

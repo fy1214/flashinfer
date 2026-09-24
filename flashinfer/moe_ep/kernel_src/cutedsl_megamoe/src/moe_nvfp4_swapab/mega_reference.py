@@ -94,6 +94,8 @@ def reference_expert_fc12(
     gate_up_clamp: Optional[float],
     topk_weights: Optional[torch.Tensor],
     ref_compute_graph: Literal["transformers", "deepgemm"],
+    online_gs: Optional[torch.Tensor] = None,  # (v_e, k1) device-read gs snapshots
+    k1_width: int = 0,  # intermediate columns per k1 slice (= mma_tiler_k)
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-expert fused fc1+fc2 reference shared by the single-rank tester
     and the multi-rank MegaMoE reference.
@@ -125,16 +127,89 @@ def reference_expert_fc12(
     if ref_compute_graph == "deepgemm":
         swiglu = swiglu * topk_weights.unsqueeze(-1)
 
-    fc1_q, fc1_sf_out = quantize_fn(swiglu, fc1_norm_const)
+    if online_gs is None:
+        fc1_q, fc1_sf_out = quantize_fn(swiglu, fc1_norm_const)
 
-    fc2_fp32 = ref_scaled_mm(
-        a=fc1_q,
-        sfa=fc1_sf_out,
-        b=fc2_weight_packed,
-        sfb=fc2_weight_sf,
-        n=hidden,
-        k=intermediate_downproj,
+        fc2_fp32 = ref_scaled_mm(
+            a=fc1_q,
+            sfa=fc1_sf_out,
+            b=fc2_weight_packed,
+            sfb=fc2_weight_sf,
+            n=hidden,
+            k=intermediate_downproj,
+        )
+        fc2_fp32 = fc2_fp32 * fc2_alpha
+        return fc2_fp32, fc1_q, fc1_sf_out, fc1_fp32
+
+    # ---- Online-amax two-level path -------------------------------------
+    # ``online_gs`` holds the device-written per-(token, k1-slice) snapshots
+    # gs = gamax/2688, so the quantization here uses exactly the scales the
+    # kernel used (order-free atomicMax makes a host-side replay ambiguous).
+    # Per slice i: quantize with norm_const := nc = 1/gs[:, i] = 2688/gamax
+    # (matching the device epilogue's ``fmin(2688/amax, FP32_MAX)``), giving
+    # q*sfc ~ P/gs_i; the fc2 merge is O = sum_i gs_i * ((q_i*sfc_i) @ W2_i),
+    # then the usual fc2_alpha.  fc1_norm_const is superseded (treated as 1).
+    # NB: nc is 1/gs, NOT 2688/gs -- the latter double-counts the 2688 that
+    # is already folded into gs = gamax/2688 and saturates sfc at 448.
+    from moe_nvfp4_swapab.runner_common import (
+        Nvfp4BlockSize,
+        nvfp4_quantize_per_block_16_gs,
+        unpack_fp4_to_f32,
+        dequant_block_scale_to_fp32,
     )
+
+    k1_cnt = online_gs.shape[1]
+    if not (k1_width * (k1_cnt - 1) < intermediate_downproj <= k1_width * k1_cnt):
+        raise ValueError(
+            f"k1_width*k1_cnt ({k1_width}*{k1_cnt}) does not cover "
+            f"intermediate_downproj ({intermediate_downproj})"
+        )
+
+    fc1_q = torch.empty(
+        swiglu.shape[0],
+        intermediate_downproj // 2,
+        dtype=torch.float4_e2m1fn_x2,
+        device=swiglu.device,
+    )
+    fc1_sf_out = torch.empty(
+        swiglu.shape[0],
+        intermediate_downproj // Nvfp4BlockSize,
+        dtype=torch.float8_e4m3fn,
+        device=swiglu.device,
+    )
+    for i in range(k1_cnt):
+        c0 = i * k1_width
+        c1 = min((i + 1) * k1_width, intermediate_downproj)
+        if c0 >= c1:
+            break
+        sl = swiglu[:, c0:c1]
+        inv_gs = 1.0 / online_gs[:, i]
+        q_i, sf_i = nvfp4_quantize_per_block_16_gs(sl, inv_gs)
+        fc1_q[:, c0 // 2 : c1 // 2] = q_i
+        fc1_sf_out[:, c0 // Nvfp4BlockSize : c1 // Nvfp4BlockSize] = sf_i
+
+    # fc2 merge: dequant both operands (fp32) and accumulate gs-weighted
+    # per-slice partial products.  fc1 dequant: q*sfc ~ P/gs_i; multiply by
+    # gs_i restores P_hat before the partial GEMM.
+    fc1_dq = unpack_fp4_to_f32(fc1_q) * fc1_sf_out.to(torch.float32).repeat_interleave(
+        Nvfp4BlockSize, dim=-1
+    )
+    w2_fp32 = dequant_block_scale_to_fp32(
+        unpack_fp4_to_f32(fc2_weight_packed).t().contiguous(),
+        fc2_weight_sf,
+        Nvfp4BlockSize,
+    ).t()
+    fc2_fp32 = torch.zeros(
+        swiglu.shape[0], hidden, dtype=torch.float32, device=swiglu.device
+    )
+    for i in range(k1_cnt):
+        c0 = i * k1_width
+        c1 = min((i + 1) * k1_width, intermediate_downproj)
+        if c0 >= c1:
+            break
+        fc2_fp32 += online_gs[:, i].unsqueeze(-1) * (
+            fc1_dq[:, c0:c1] @ w2_fp32[c0:c1, :]
+        )
     fc2_fp32 = fc2_fp32 * fc2_alpha
     return fc2_fp32, fc1_q, fc1_sf_out, fc1_fp32
 
