@@ -118,10 +118,11 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
         params.sm_scale = sm_scale;
         params.ckv_scale = static_cast<float>(ckv_scale);
         params.kpe_scale = static_cast<float>(kpe_scale);
-        params.ckv_scale_arr =
-            maybe_ckv_scale_arr.has_value()
-                ? static_cast<const float*>(maybe_ckv_scale_arr.value().data_ptr())
-                : nullptr;
+        if (maybe_ckv_scale_arr.has_value()) {
+          params.ckv_scale_arr = static_cast<float*>(maybe_ckv_scale_arr.value().data_ptr());
+          params.ckv_scale_stride_page = maybe_ckv_scale_arr.value().stride(0);
+          params.ckv_scale_stride_n = maybe_ckv_scale_arr.value().stride(1);
+        }
         params.return_lse_base_on_e = return_lse_base_on_e;
 
         cudaError_t status = mla::BatchMLAPagedAttention<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(

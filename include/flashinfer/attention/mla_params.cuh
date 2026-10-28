@@ -76,8 +76,14 @@ struct MLAParams {
   // dequantized = ckv_scale * static_cast<float>(ckv_fp8); same for kpe.
   float ckv_scale = 1.f;
   float kpe_scale = 1.f;
-  // Row-major [token][128-element group] FP32 scales override ckv_scale.
-  const float* ckv_scale_arr = nullptr;
+  // Optional per-token CKV scales, paged like the cache itself:
+  // ckv_scale_arr[page * ckv_scale_stride_page + entry * ckv_scale_stride_n].
+  // When non-null it replaces ckv_scale; kpe_scale stays per-tensor either way.
+  // Contiguous [pages, page_size] has stride_n=1; an in-row packed view of
+  // [512 fp8 | fp32] typically has stride_n = row_bytes/4 (e.g. 132 for 528B).
+  float* ckv_scale_arr = nullptr;
+  uint32_t ckv_scale_stride_page = 0;
+  uint32_t ckv_scale_stride_n = 1;
   bool return_lse_base_on_e;
 };
 

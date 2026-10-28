@@ -2204,10 +2204,14 @@ class BatchMLAPagedAttentionWrapper:
                     "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
                     f"got SM{major}{minor}."
                 )
-            if q_data_type != torch.bfloat16:
+            # FP16 Q selects vec_cast<half, fp8_e4m3>, which lowers to the
+            # native `cvt.rn.f16x2.e4m3x2`; the BF16 path has no such
+            # instruction on SM90 and falls back to a software bit-twiddling
+            # dequant. Both are exercised by tests/attention/test_mla_fp8_kv.py.
+            if q_data_type not in (torch.bfloat16, torch.float16):
                 raise ValueError(
                     "FP8 kv_data_type for MLA currently only supports "
-                    f"q_data_type=torch.bfloat16, got {q_data_type}."
+                    f"q_data_type in (torch.bfloat16, torch.float16), got {q_data_type}."
                 )
             if head_dim_ckv != 512 or head_dim_kpe not in (0, 64):
                 raise ValueError(
@@ -2244,6 +2248,7 @@ class BatchMLAPagedAttentionWrapper:
         self._page_size = page_size
         self._sm_scale = sm_scale
         self._head_dim_ckv = head_dim_ckv
+        self._head_dim_kpe = head_dim_kpe
         # Used by run() to reject dtype mismatches; the C++ launcher
         # reinterprets storage by the JIT-template type chosen at plan(),
         # so a mismatch produces silent wrong output.
@@ -2487,12 +2492,27 @@ class BatchMLAPagedAttentionWrapper:
                 raise ValueError(
                     f"kpe_scale must be a finite positive value, got {kpe_scale}"
                 )
+            if ckv_scale_arr is not None:
+                # Per-token CKV scales, paged like ckv_cache. ckv_scale stays
+                # the reference the kernel picks its Q accumulator scale from.
+                if ckv_scale_arr.dtype != torch.float32:
+                    raise ValueError(
+                        f"ckv_scale_arr must be float32, got {ckv_scale_arr.dtype}"
+                    )
+                if ckv_scale_arr.shape != ckv_cache.shape[:2]:
+                    raise ValueError(
+                        f"ckv_scale_arr must be shaped like the first two dims of "
+                        f"ckv_cache {tuple(ckv_cache.shape[:2])}, got "
+                        f"{tuple(ckv_scale_arr.shape)}"
+                    )
+                if self._backend != "fa3":
+                    raise ValueError("ckv_scale_arr requires the fa3 backend.")
         else:
-            if (
-                ckv_scale is not None
-                or ckv_scale_arr is not None
-                or kpe_scale is not None
-            ):
+            if ckv_scale_arr is not None:
+                raise ValueError(
+                    "ckv_scale_arr is only valid when kv_data_type is FP8."
+                )
+            if ckv_scale is not None or kpe_scale is not None:
                 raise ValueError(
                     "ckv_scale / ckv_scale_arr / kpe_scale are only valid when "
                     "kv_data_type is FP8."
@@ -2526,24 +2546,6 @@ class BatchMLAPagedAttentionWrapper:
                     lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
                 )
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
-        if ckv_scale_arr is not None:
-            if not kv_is_fp8:
-                raise ValueError(
-                    "ckv_scale_arr is only valid when kv_data_type is FP8."
-                )
-            expected_scale_shape = (
-                *ckv_cache.shape[:-1],
-                self._head_dim_ckv // 128,
-            )
-            check_shape_dtype_device(
-                ckv_scale_arr,
-                expected_scale_shape,
-                torch.float32,
-                ckv_cache.device,
-                "ckv_scale_arr",
-            )
-            if not ckv_scale_arr.is_contiguous():
-                raise ValueError("ckv_scale_arr must be contiguous.")
         run_args = (
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -2567,6 +2569,120 @@ class BatchMLAPagedAttentionWrapper:
         self._cached_module.run(*run_args, *profiler_args)
 
         return (out, lse) if return_lse else out
+
+    def run_packed_kv(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv: torch.Tensor,
+        *,
+        scale_offset: int,
+        kpe_cache: Optional[torch.Tensor] = None,
+        kpe_scale: float = 1.0,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+        profiler_buffer: Optional[torch.Tensor] = None,
+        kv_len: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        r"""FP8 MLA on a packed KV cache with an in-row per-token scale.
+
+        Each cache row is ``[head_dim_ckv fp8 bytes | scale slot | ...]`` and
+        holds exactly one float32 scale per token (G=1, shared by the NoPE
+        and RoPE halves), written at ``scale_offset`` bytes from the row
+        start. The scale tensor is reached through ``ckv_scale_stride_page``
+        and ``ckv_scale_stride_n`` read off ``kv``, so no scale copy or
+        separate buffer is needed.
+
+        Args:
+            q_nope : torch.Tensor
+                The query tensor without rope, shape: ``[batch_size, num_heads, head_dim_ckv]``.
+            q_pe : torch.Tensor
+                The rope part of the query tensor, shape: ``[batch_size, num_heads, head_dim_kpe]``.
+            kv : torch.Tensor
+                The packed fp8 cache, shape: ``[num_pages, page_size, row_bytes]``
+                with ``row_bytes >= head_dim_ckv + 4`` and the last
+                dimension contiguous. Rows may sit at any page stride
+                (e.g. a 528-byte row of 512 fp8 bytes + 16-byte scale slot).
+            scale_offset : int
+                Byte offset of the per-token fp32 scale within each row.
+                Must be 4-byte aligned.
+            kpe_cache : Optional[torch.Tensor]
+                The RoPE part of the kv-cache, ``[num_pages, page_size, head_dim_kpe]``
+                fp8, quantized with the same per-token scale as ``kv``.
+                May be omitted when ``head_dim_kpe == 0`` (NoPE).
+
+        Returns:
+            torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
+                Attention output, and optionally the logsumexp values.
+        """
+        if self._kv_data_type != torch.float8_e4m3fn:
+            raise ValueError(
+                "run_packed_kv requires kv_data_type=torch.float8_e4m3fn, "
+                f"got {self._kv_data_type}."
+            )
+        if kv.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"kv must be float8_e4m3fn, got {kv.dtype}.")
+        if kv.ndim != 3 or kv.stride(-1) != 1:
+            raise ValueError(
+                "kv must be [num_pages, page_size, row_bytes] with a "
+                "contiguous last dimension (one packed row)."
+            )
+        if kv.stride(0) % 4 != 0:
+            raise ValueError(
+                f"kv page stride {kv.stride(0)} is not 4-byte aligned, cannot "
+                "alias the in-row scale as float32."
+            )
+        row_bytes = kv.shape[-1]
+        if row_bytes < self._head_dim_ckv + 4:
+            raise ValueError(
+                f"packed row has {row_bytes} bytes, need at least "
+                f"{self._head_dim_ckv + 4} (head_dim_ckv + 4B scale)."
+            )
+        if scale_offset % 4 != 0 or scale_offset + 4 > row_bytes:
+            raise ValueError(
+                f"scale_offset={scale_offset} must be 4-byte aligned and fit "
+                f"within the {row_bytes}-byte row."
+            )
+        if kpe_cache is None:
+            if self._head_dim_kpe != 0:
+                raise ValueError(
+                    "kpe_cache is required when head_dim_kpe > 0; pass an "
+                    "empty [num_pages, page_size, 0] tensor for NoPE."
+                )
+            kpe_cache = torch.empty(
+                kv.shape[0], kv.shape[1], 0, dtype=torch.float8_e4m3fn, device=kv.device
+            )
+        # Zero-copy views: fp8 is one byte per element, so byte offsets are
+        # element offsets. Slice the 4-byte scale slot out of each row
+        # first, then alias it as one float32. For a packed [512|fp32] row
+        # the resulting strides are (page_size * row_bytes/4, row_bytes/4);
+        # the kernel indexes page * stride_page + entry * stride_n.
+        ckv_cache = kv[..., : self._head_dim_ckv]
+        ckv_scale_arr = (
+            kv[..., scale_offset : scale_offset + 4]
+            .view(torch.float32)
+            .squeeze(-1)
+        )
+        return self.run(
+            q_nope,
+            q_pe,
+            ckv_cache,
+            kpe_cache,
+            out=out,
+            lse=lse,
+            return_lse=return_lse,
+            profiler_buffer=profiler_buffer,
+            kv_len=kv_len,
+            page_table=page_table,
+            return_lse_base_on_e=return_lse_base_on_e,
+            o_scale=o_scale,
+            ckv_scale_arr=ckv_scale_arr,
+            kpe_scale=kpe_scale,
+        )
 
 
 # ---------------------------------------------------------------------------

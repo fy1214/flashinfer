@@ -34,7 +34,9 @@ struct StandardAttention : AttentionVariantBase {
   float sm_scale_log2;
   float ckv_scale;
   float kpe_scale;
-  const float* ckv_scale_arr;
+  float* ckv_scale_arr;
+  uint32_t ckv_scale_stride_page;
+  uint32_t ckv_scale_stride_n;
 
   PROFILER_CLOSURE_PARAMS_DECL
 
@@ -45,6 +47,8 @@ struct StandardAttention : AttentionVariantBase {
     ckv_scale = params.ckv_scale;
     kpe_scale = params.kpe_scale;
     ckv_scale_arr = params.ckv_scale_arr;
+    ckv_scale_stride_page = params.ckv_scale_stride_page;
+    ckv_scale_stride_n = params.ckv_scale_stride_n;
   }
 };
 
